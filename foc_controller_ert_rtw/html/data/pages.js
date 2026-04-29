@@ -1,0 +1,1 @@
+var reportPages = [["摘要","foc_controller_survey.html"],["子系统报告","foc_controller_subsystems.html"],["代码接口报告","foc_controller_interface.html"],["可追溯性报告","foc_controller_trace.html"],["静态代码度量报告","foc_controller_metrics.html"],["代码替换报告","foc_controller_replacements.html"],["代码生成器假设","foc_controller_coderassumptions.html"]];

@@ -1,0 +1,1 @@
+var modelInfo = {model:"foc_controller"};var modelHierarchy=[{model:"foc_controller",relativePath:"_internal.html",parent:"null"},];var AddCode = true;var ProtectedModel = false;
