@@ -84,6 +84,8 @@ float app_control_get_align_id_ref(void);
 
 /** @brief 获取对齐后的电角度偏移 [rad]，定义：theta_e = pp*theta_m - offset_e */
 float app_control_get_theta_offset(void);
+void  app_control_set_fine_offset(float rad);
+float app_control_get_fine_offset(void);
 
 /* ============================================================
  * 速度环接口（V1：纯比例起步）
@@ -117,7 +119,7 @@ typedef enum {
 } CtrlMode_t;
 
 /** 方向符号 — 首次调试确认，防止补偿反向 */
-#define MOTOR_SIGN      (+1.0f)   /**< 编码器正向：调试时改为 -1.0f 或 +1.0f */
+#define MOTOR_SIGN      (+1.0f)   /**< 编码器正向 */
 #define IMU_SIGN        (+1.0f)   /**< IMU俯仰正向：同上 */
 
 /** 位置软/硬限位角度（单位：度） */

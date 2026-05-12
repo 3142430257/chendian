@@ -16,6 +16,7 @@
 #include "encoder_if.h"
 #include "app_control.h"
 #include "mpu6050.h"
+#include "openloop_stab.h"
 #include "stm32g4xx_hal.h"
 #include <stdio.h>
 #include <string.h>
@@ -80,7 +81,11 @@ void telemetry_update(void)
     float id_meas    = meas.id_meas;
     float iq_meas    = meas.iq_meas;
 
-    char buf[540];
+    /* 开环自稳数据 */
+    uint8_t ol_active = openloop_stab_is_active() ? 1u : 0u;
+    float   ol_omega  = openloop_stab_get_omega_dps();
+
+    char buf[600];
     int  len = snprintf(buf, sizeof(buf),
         "T,%lu,IU,%.3f,IV,%.3f,IW,%.3f,VBUS,%.2f,"
         "M_ANG,%.1f,E_ANG,%.1f,ST,%u,FAULT,%u,"
@@ -90,6 +95,7 @@ void telemetry_update(void)
         "SPD_EST,%.2f,SPD_MODE,%u,SPD_REF,%.2f,IQ_REF,%.3f,"
         "ID_MEAS,%.3f,IQ_MEAS,%.3f,"
         "CTRL,%u,POS_TGT,%.2f,POS_ACT,%.2f,POS_ERR,%.2f,IMU,%.2f,IMU_RDY,%u,STAB_LIM,%.1f,IMU_HOME,%.2f,"
+        "OL_ACT,%u,OL_W,%.1f,"
         "RAW,%u,%u,%u,%u,OFF,%u,%u,%u\r\n",
         (unsigned long)now,
         meas.iu_a, meas.iv_a, meas.iw_a,
@@ -101,6 +107,7 @@ void telemetry_update(void)
         id_meas, iq_meas,
         (unsigned)ctrl_mode, pos_target, pos_actual, pos_err, imu_pitch, (unsigned)imu_rdy,
         app_control_get_stab_lim(), app_control_get_imu_home(),
+        (unsigned)ol_active, ol_omega,
         adc_raw[0], adc_raw[1], adc_raw[2], adc_raw[3],
         iu_offset_raw, iv_offset_raw, iw_offset_raw);
 

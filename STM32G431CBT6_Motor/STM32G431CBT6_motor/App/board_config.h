@@ -81,7 +81,7 @@ extern uint16_t iw_offset_raw;
 #define ADC_TO_VBUS(raw)    (ADC_TO_VOLT(raw) * VBUS_DIVIDER)
 
 /* VBUS 软件保护阈值 */
-#define VBUS_MIN_V          (8.0f)
+#define VBUS_MIN_V          (4.5f)   /* 放宽到4.5V：适配非标电源和分压比误差 */
 #define VBUS_MAX_V          (26.0f)
 
 /* ============================================================
@@ -108,7 +108,7 @@ extern uint16_t iw_offset_raw;
  * PWM 频率 ~1kHz，±10% 容差 → 必须用比值法换算
  * angle_rad = (high_count / total_count) × 2π
  * ============================================================ */
-#define ENCODER_TIMEOUT_MS  (100U)  /* 100ms 容限：AS5048A 1kHz，允许短暂电磁干扰不误报 */
+#define ENCODER_TIMEOUT_MS  (200U)  /* 200ms：编码器 1kHz，EMI 严重时放宽，由跳变过滤器兜底 */
 
 /* ============================================================
  * 引脚逻辑

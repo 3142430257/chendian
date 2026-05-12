@@ -29,6 +29,13 @@ static volatile float    s_angle_rad    = 0.0f;
 static volatile uint32_t s_last_cap_ms  = 0;
 static volatile bool     s_valid        = false;
 
+/* 跳变过滤器：相邻两次有效捕获间角度差超过此阈值则丢弃。
+ * 阈值 0.5 rad ≈ 29° 机械角。正常最大转速 ~10 rad/s，1ms 间隔
+ * 内最大变化 ~0.01 rad，0.5 rad 裕量 > 50x，EMI 跳变（>2 rad）会被拦截。 */
+#define ENC_GLITCH_THRESH_RAD  (0.5f)
+static volatile float   s_last_valid_angle_rad = 0.0f;
+static volatile bool    s_had_valid_reading    = false;
+
 /* AS5048A 有效占空比范围（去除无效区间）*/
 #define AS5048_DUTY_MIN  (0.003f)   /* 0.3% */
 #define AS5048_DUTY_MAX  (0.997f)   /* 99.7% */
@@ -72,9 +79,25 @@ void encoder_pwm_capture_callback(void *htim_ptr)
         /* 有效性检查 */
         if (duty >= AS5048_DUTY_MIN && duty <= AS5048_DUTY_MAX)
         {
-            /* 归一化到 [0, 1]，再映射到 [0, 2π) */
+            /* 归一化到 [0, 1)，再映射到 [0, 2π) */
             float norm = (duty - AS5048_DUTY_MIN) / (AS5048_DUTY_MAX - AS5048_DUTY_MIN);
+
+            /* 跳变过滤：EMI 会导致偶发性巨大角度跳变。
+             * 但超时后（如 ALIGN 期间 EMI 持续干扰 → 编码器超时 → 电机
+             * 确实转动了），第一个新读数无条件接受，不比较。*/
+            if (s_had_valid_reading && s_valid) {
+                float diff = norm - s_last_valid_angle_rad;
+                /* 处理 0↔2π 环绕 */
+                if (diff >  1.0f) diff -= 2.0f;
+                if (diff < -1.0f) diff += 2.0f;
+                if (fabsf(diff) > ENC_GLITCH_THRESH_RAD) {
+                    return;  /* 丢弃 EMI 跳变，保留上次有效读数 */
+                }
+            }
+
             s_angle_rad   = norm * 2.0f * (float)M_PI;
+            s_last_valid_angle_rad = norm;
+            s_had_valid_reading    = true;
             s_last_cap_ms = HAL_GetTick();
             s_valid       = true;
         }

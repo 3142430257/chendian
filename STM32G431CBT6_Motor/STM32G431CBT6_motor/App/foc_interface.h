@@ -100,6 +100,38 @@ bool foc_interface_get_dq_stats(FocDqStats_t *out);
 #define FOC_ADC_IDX_VTEMP (4U)
 #define FOC_ADC_CH_COUNT  (5U)
 
+/* ============================================================
+ * 开环强制换向测试（不需要编码器）
+ * ============================================================ */
+
+/**
+ * @brief  启动开环模式：手动扫描电角度 + 固定电压驱动
+ * @param  elec_omega_rps  电角速度 [rad/s]（= 机械角速度 × 极对数）
+ * @param  vq_volt         施加的 Vq 电压 [V]（建议 0.3~0.8V）
+ * @note   需要先手动 ctrl_sd_set(true) 使能驱动板
+ */
+void foc_openloop_start(float elec_omega_rps, float vq_volt);
+
+/** @brief  停止开环模式 */
+void foc_openloop_stop(void);
+
+/** @brief  是否处于开环模式 */
+bool foc_openloop_is_active(void);
+
+/** @brief  获取 ISR 实际执行频率 [Hz]（每秒更新一次）*/
+uint32_t foc_interface_get_isr_freq(void);
+
+/** @brief  PI 旁路模式：on=true 时 RUN 状态输出 50/50/50 占空比（零电压）*/
+void foc_interface_set_pi_bypass(bool on);
+void foc_interface_set_bypass_vq(float vq);
+
+/** @brief  强制闭环旋转：角度固定递增 + PI电流环（不用编码器）*/
+void foc_forced_start(float elec_omega_rps);
+void foc_forced_stop(void);
+
+/** @brief  开环校准数据读取 */
+void foc_calib_get(float *avg_plus, float *avg_minus, uint32_t *cnt, float *enc_last);
+
 #ifdef __cplusplus
 }
 #endif

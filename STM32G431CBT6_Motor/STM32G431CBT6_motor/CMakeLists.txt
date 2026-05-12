@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/telemetry.c
     App/app_control.c
     App/mpu6050.c
+    App/openloop_stab.c    # 开环自稳（临时，编码器修好后删除）
     # ---- Simulink 生成代码 ----
     App/foc_controller.c
 )

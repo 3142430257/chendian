@@ -50,7 +50,8 @@ PAT = re.compile(
     r"SPD_EST,([-\d.]+),SPD_MODE,(\d+),SPD_REF,([-\d.]+),IQ_REF,([-\d.]+),"
     r"ID_MEAS,([-\d.]+),IQ_MEAS,([-\d.]+),"
     r"CTRL,(\d+),POS_TGT,([-\d.]+),POS_ACT,([-\d.]+),POS_ERR,([-\d.]+),"
-    r"IMU,([-\d.]+),IMU_RDY,(\d+)"  # STAB_LIM/IMU_HOME optional, search() ignores trailing
+    r"IMU,([-\d.]+),IMU_RDY,(\d+).*?"
+    r"OL_ACT,(\d+),OL_W,([-\d.]+)"
 )
 DQ_STAT_PAT = re.compile(
     r"DQ_STAT,ID_AVG,([-\d.]+),IQ_AVG,([-\d.]+),"
@@ -111,6 +112,8 @@ def parse_line(line):
         "pos_err":   float(m.group(24)),  # 误差 [deg]
         "imu":       float(m.group(25)),  # IMU倾斜角 [deg]
         "imu_rdy":   int(m.group(26)),    # 0=IMU未就绪 1=就绪
+        "ol_active": int(m.group(27)),    # 开环自稳激活
+        "ol_omega":  float(m.group(28)),  # 开环输出速度 [°/s]
     }
 
 def print_fault(f_code):
@@ -138,16 +141,13 @@ def diagnose(hist, auto_stopped_flag, latest_dq_stat=None):
     vbus_min = min(h["vbus"] for h in run_hist)
     vbus_max = max(h["vbus"] for h in run_hist)
 
-    # 自动急停保护
-    if st == 4:
-        if (i_total > 1.5 or vbus_min < 10.0) and not auto_stopped_flag:
-            if ser is not None:
-                ser.write(b'd')
-            print("\n🚨 [AUTO-PROTECT] 检测到恶劣工况 (I>1.5A 或 VBUS<10V)，自动发送 'd' 停机！🚨\n")
-            auto_stopped_flag = True
-    else:
-        # 非 RUN 状态时清除标志位
-        auto_stopped_flag = False
+    # 自动急停保护（已禁用：VBUS 标定不准导致误触发）
+    # if st == 4:
+    #     if (i_total > 2.5 or vbus_min < 4.0) and not auto_stopped_flag:
+    #         if ser is not None:
+    #             ser.write(b'd')
+    #         print("\n🚨 [AUTO-PROTECT] 自动停机！🚨\n")
+    #         auto_stopped_flag = True
 
     if len(hist) >= 5:
         dt_ms = hist[-1]["t_ms"] - hist[-5]["t_ms"]
@@ -260,7 +260,7 @@ def diagnose(hist, auto_stopped_flag, latest_dq_stat=None):
                 msgs.append(f"⚠️ 驱动相均值({pos_avg:+.3f}A)<0.05 → 通电/幅值/CTRL_SD?")
 
 
-    # ── IMU 一律显示，不依赖 ctrl_mode（READY 状态也要看到）──────────────────
+    # ── IMU 一律显示 ──
     imu_rdy_g = latest.get("imu_rdy", 0)
     imu_val_g = latest.get("imu", 0.0)
     if imu_rdy_g:
@@ -268,14 +268,28 @@ def diagnose(hist, auto_stopped_flag, latest_dq_stat=None):
     else:
         msgs.append("IMU_RDY=0⚠️")
 
+    # ── 开环自稳状态 ──
+    ol_act = latest.get("ol_active", 0)
+    ol_w   = latest.get("ol_omega", 0.0)
+    if ol_act:
+        # 判断补偿方向
+        if abs(ol_w) < 0.5:
+            dir_str = "⏸停"
+        elif ol_w > 0:
+            dir_str = "↻CW"
+        else:
+            dir_str = "↺CCW"
+        imu_err = imu_val_g  # 正=往正方向偏
+        msgs.append(f"🔄OL_STAB|IMU误差={imu_err:+.1f}°|输出={ol_w:+.1f}°/s {dir_str}")
+
     return " | ".join(msgs), auto_stopped_flag
 
 
 def keyboard_thread():
     """键盘输入线程"""
-    print("\n--- 命令: a=ALIGN e=ENABLE d=DISABLE +=Iq+0.05 -=Iq-0.05 ]=Spd+30°/s [=Spd-30°/s 0=停转 s=STATUS ---")
-    print("---          P0/P30/P-30=位置  H=回零(同步IMU零点)  G=自稳  GLIM10/GLIM30=自稳限幅 ---")
-    print("---          KP1.5/KD0.03/PLIM45/DZ0.5=调参  STEP20/HTEST=测试  q=退出 ---\n")
+    print("\n--- 命令: a=ALIGN e=ENABLE d=DISABLE +=Iq+0.05 -=Iq-0.05 ]=Spd+30°/s [=Spd-30°/s 0=停转 ---")
+    print("---       L=开环自稳 O=开环旋转 X=停止开环 E=编码器诊断 ---")
+    print("---       P0/P30/P-30=位置  H=回零  G=自稳  KP1.5/KD0.03=调参  q=退出 ---\n")
     while True:
         try:
             c = input()
@@ -285,7 +299,7 @@ def keyboard_thread():
                 sys.exit(0)
             if ser:
                 # 单字符即时命令（不加\r\n，固件端立即处理）
-                if c in ('a', 'e', 'd', '+', '-', 's', ']', '[', '0') and len(c) == 1:
+                if c in ('a', 'e', 'd', '+', '-', 's', ']', '[', '0', 'E', 'O', 'X', 'L') and len(c) == 1:
                     ser.write(c.encode())
                     print(f"  >>> 手动发送 '{c}'")
                 else:

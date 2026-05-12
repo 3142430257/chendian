@@ -35,6 +35,9 @@
 #include "foc_interface.h"
 #include "telemetry.h"
 #include "mpu6050.h"       /* IMU 驱动（I2C1，CubeMX 使能后生效）*/
+#include "openloop_stab.h" /* 开环自稳（临时方案，编码器修好后删除）*/
+#include "board_config.h"  /* MOTOR_POLE_PAIRS */
+#include "encoder_if.h"    /* encoder_get_angle_rad */
 /* 注意：CubeMX 生成 i2c.h 后下一行自动插入 */
 /* USER CODE END Includes */
 
@@ -93,10 +96,10 @@ static void cmd_process_line(char *line)
     extern UART_HandleTypeDef huart3;
     static float cmd_omega_ref = 0.0f;
     static float cmd_iq_ref    = 0.0f;
-    char resp[80];
+    char resp[256];
     int  rlen = 0;
 
-    static const char KNOWN_SINGLES[] = "edas+-][0";
+    static const char KNOWN_SINGLES[] = "edas+-][0EOXLQ";
     if (line[0] != '\0' && line[1] == '\0' &&
         strchr(KNOWN_SINGLES, line[0]) != NULL) {
         char c = line[0];
@@ -107,8 +110,13 @@ static void cmd_process_line(char *line)
             app_control_set_speed_mode(false);
             if (app_control_enable())
                 rlen = snprintf(resp, sizeof(resp), "[CMD] ENABLED, ST=%u\r\n", app_control_get_state());
-            else
-                rlen = snprintf(resp, sizeof(resp), "[CMD] ENABLE REJECTED, ST=%u\r\n", app_control_get_state());
+            else {
+                uint8_t st = app_control_get_state();
+                FocMeasurement_t dbg_m; foc_interface_get_measurement(&dbg_m);
+                rlen = snprintf(resp, sizeof(resp),
+                    "[CMD] REJECT: ST=%u VBUS=%.1f ENC=%u\r\n",
+                    st, dbg_m.vbus_v, encoder_is_valid() ? 1u : 0u);
+            }
             break;
         case 'd':
             cmd_iq_ref = 0.0f; cmd_omega_ref = 0.0f;
@@ -121,8 +129,11 @@ static void cmd_process_line(char *line)
             app_control_set_speed_mode(false);
             if (app_control_start_align())
                 rlen = snprintf(resp, sizeof(resp), "[CMD] ALIGN START, ST=%u\r\n", app_control_get_state());
-            else
-                rlen = snprintf(resp, sizeof(resp), "[CMD] ALIGN REJECTED\r\n");
+            else {
+                FocMeasurement_t dbg; foc_interface_get_measurement(&dbg);
+                rlen = snprintf(resp, sizeof(resp), "[CMD] ALIGN REJECTED ST=%u VBUS=%.1f ENC=%u\r\n",
+                    app_control_get_state(), dbg.vbus_v, encoder_is_valid() ? 1u : 0u);
+            }
             break;
         case 's':
             rlen = snprintf(resp, sizeof(resp), "[CMD] ST=%u MODE=%u POS=%.2f TGT=%.2f\r\n",
@@ -159,9 +170,202 @@ static void cmd_process_line(char *line)
             app_control_set_omega_ref(0.0f);
             rlen = snprintf(resp, sizeof(resp), "[CMD] SPD_REF=0 (STOP)\r\n");
             break;
+        case 'E': {
+            uint16_t adc_snap[5];
+            foc_interface_get_adc_raw(adc_snap);
+            float offset = app_control_get_theta_offset();
+            float mech = encoder_get_angle_rad();
+            float mech_deg = mech * (180.0f / 3.14159265f);
+            float elec_raw = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
+            uint32_t isr_hz = foc_interface_get_isr_freq();
+            float ea1 = elec_raw - offset;
+            while (ea1 < 0) ea1 += 6.2832f;
+            float ea2 = offset - elec_raw;
+            while (ea2 < 0) ea2 += 6.2832f;
+            int n = snprintf(resp, sizeof(resp),
+                "[CMD] M=%.1f E=%.3f OFF=%.3f fwd=%.3f rev=%.3f ISR=%lu ADC=[%u,%u,%u]\r\n",
+                mech_deg, elec_raw, offset, ea1, ea2,
+                (unsigned long)isr_hz, adc_snap[0], adc_snap[1], adc_snap[2]);
+            HAL_UART_Transmit(&huart3, (uint8_t*)resp, (uint16_t)n, 200);
+            rlen = 0;
+            break;
+        }
+        case 'O': {
+            /* 开环测试：Vq=2V 克服齿槽，ω=5.5 rad/s 电角速 ≈ 0.5 rad/s 机械 ≈ 29°/s */
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); /* CTRL_SD 使能 */
+            foc_openloop_start(5.5f, 2.0f);
+            rlen = snprintf(resp, sizeof(resp), "[CMD] OPENLOOP ON w=5.5 Vq=2.0\r\n");
+            break;
+        }
+        case 'X':
+            openloop_stab_stop();   /* 先停自稳（内部会 stop openloop）*/
+            foc_openloop_stop();    /* 确保纯开环模式也停 */
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+            rlen = snprintf(resp, sizeof(resp), "[CMD] OPENLOOP OFF\r\n");
+            break;
+        case 'L':
+            if (mpu6050_is_ready()) {
+                openloop_stab_start();
+                rlen = snprintf(resp, sizeof(resp), "[CMD] OL_STAB ON\r\n");
+            } else {
+                rlen = snprintf(resp, sizeof(resp), "[CMD] OL_STAB FAIL: IMU not ready\r\n");
+            }
+            break;
+        case 'Q': {
+            float mech = encoder_get_angle_rad();
+            float elec_raw = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
+            float off = app_control_get_theta_offset();
+            float ea1 = elec_raw - off;
+            while (ea1 < 0) ea1 += 6.2832f;
+            float ea2 = off - elec_raw;
+            while (ea2 < 0) ea2 += 6.2832f;
+            int n = snprintf(resp, sizeof(resp),
+                "[ENC] M=%.3f E=%.3f off=%.3f fwd=%.3f rev=%.3f\r\n",
+                mech, elec_raw, off, ea1, ea2);
+            HAL_UART_Transmit(&huart3, (uint8_t*)resp, (uint16_t)n, 200);
+            rlen = 0;
+            break;
+        }
         default: break;
         }
         goto send_resp;
+    }
+
+    /* B 切换 PI 旁路模式（RUN 时强制零电压输出，测 ADC 读数是否正确）*/
+    if (line[0] == 'B') {
+        static bool bp = false;
+        bp = !bp;
+        foc_interface_set_pi_bypass(bp);
+        rlen = snprintf(resp, sizeof(resp),
+            "[CMD] PI_BYPASS=%s\r\n", bp ? "ON(零电压)" : "OFF(正常)");
+    }
+
+    /* F<deg> 手动微调电角度偏移（运行中可改）*/
+    if (line[0] == 'F') {
+        float deg;
+        if (parse_float(line + 1, &deg)) {
+            float rad = deg * (3.14159265f / 180.0f);
+            app_control_set_fine_offset(rad);
+            rlen = snprintf(resp, sizeof(resp),
+                "[CMD] FINE_OFF=%.0f deg (%.3f rad)\r\n", deg, rad);
+        } else {
+            rlen = snprintf(resp, sizeof(resp),
+                "[CMD] FINE_OFF=%.1f deg\r\n",
+                app_control_get_fine_offset() * (180.0f / 3.14159265f));
+        }
+    }
+
+    /* I<amps> 直接设 IqRef 绕过速度环（运行中可改，用于测试电流环+角度）*/
+    else if (line[0] == 'I' && (line[1] == '-' || line[1] == '+' || (line[1] >= '0' && line[1] <= '9'))) {
+        float val;
+        if (parse_float(line + 1, &val)) {
+            /* 关闭速度模式，直接写 IqRef */
+            app_control_set_speed_mode(false);
+            app_control_set_iq_ref(val);
+            rlen = snprintf(resp, sizeof(resp),
+                "[CMD] IQ_DIRECT=%.3f A (速度环已关)\r\n", val);
+        }
+    }
+
+    /* D: 编码器诊断——打印所有关键角度值 */
+    if (line[0] == 'D' && line[1] == '\0') {
+        float mech = encoder_get_angle_rad();
+        float elec_raw = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
+        float offset = app_control_get_theta_offset();
+        float fine = app_control_get_fine_offset();
+        float ea_fwd = elec_raw - offset + fine;
+        while (ea_fwd < 0) ea_fwd += 6.2832f;
+        while (ea_fwd >= 6.2832f) ea_fwd -= 6.2832f;
+        float ea_rev = offset - elec_raw + fine;
+        while (ea_rev < 0) ea_rev += 6.2832f;
+        while (ea_rev >= 6.2832f) ea_rev -= 6.2832f;
+        rlen = snprintf(resp, sizeof(resp),
+            "[ENC] M=%.3f E=%.3f off=%.3f fwd=%.3f rev=%.3f\r\n",
+            mech, elec_raw, offset, ea_fwd, ea_rev);
+    }
+
+    /* V<vq>: 编码器角度 + 直接电压（完全绕过 PI，决定性测试）
+     * V2.0 = 启用，Vq=2V    V0 = 关闭 */
+    if (line[0] == 'V' && (line[1] == '-' || line[1] == '+' || (line[1] >= '0' && line[1] <= '9'))) {
+        float vq = 0.0f;
+        parse_float(line + 1, &vq);
+        if (fabsf(vq) > 0.01f) {
+            foc_interface_set_bypass_vq(vq);
+            foc_interface_set_pi_bypass(true);
+            rlen = snprintf(resp, sizeof(resp),
+                "[CMD] VDIRECT ON Vq=%.1f (PI bypass, encoder angle)\r\n", vq);
+        } else {
+            foc_interface_set_bypass_vq(0.0f);
+            foc_interface_set_pi_bypass(false);
+            rlen = snprintf(resp, sizeof(resp), "[CMD] VDIRECT OFF\r\n");
+        }
+    }
+
+    /* C: 自动校准——开环旋转3秒，测量编码器关系 */
+    if (line[0] == 'C' && line[1] == '\0') {
+        foc_openloop_start(5.5f, 2.0f);
+        HAL_Delay(3000);
+        foc_openloop_stop();
+        float avg_p, avg_m, enc_last;
+        uint32_t cnt;
+        foc_calib_get(&avg_p, &avg_m, &cnt, &enc_last);
+        int n = snprintf(resp, sizeof(resp),
+            "[CMD] CALIB N=%lu avg(OL+enc)=%.2f avg(OL-enc)=%.2f enc=%.2f\r\n",
+            (unsigned long)cnt, avg_p, avg_m, enc_last);
+        HAL_UART_Transmit(&huart3, (uint8_t*)resp, (uint16_t)n, 200);
+        rlen = 0;
+    }
+
+    /* R<iq>: 强制闭环旋转（绕过编码器，纯PI电流环 + 固定角速度）
+     * 用于验证除编码器外的完整FOC链路
+     * R0.3 = 启动，Iq=0.3A
+     * R0 或 R = 停止 */
+    if (line[0] == 'R') {
+        float iq = 0.0f;
+        if (line[1] != '\0') parse_float(line + 1, &iq);
+        if (fabsf(iq) > 0.01f) {
+            app_control_set_speed_mode(false);
+            app_control_set_iq_ref(iq);
+            foc_forced_start(5.5f);  /* 5.5 rad/s 电角速度 */
+            rlen = snprintf(resp, sizeof(resp),
+                "[CMD] FORCED ON w=5.5 Iq=%.2f\r\n", iq);
+        } else {
+            foc_forced_stop();
+            app_control_set_iq_ref(0.0f);
+            rlen = snprintf(resp, sizeof(resp), "[CMD] FORCED OFF\r\n");
+        }
+    }
+
+    /* T: 自动角度扫描——找到正确的电角度偏移 */
+    if (line[0] == 'T' && line[1] == '\0') {
+        if (app_control_get_state() != STATE_RUN) {
+            rlen = snprintf(resp, sizeof(resp), "[CMD] T: need RUN state first\r\n");
+        } else {
+            float results[12];
+            for (int step = 0; step < 12; step++) {
+                float angle_rad = (float)step * 30.0f * 3.14159265f / 180.0f;
+                app_control_set_fine_offset(angle_rad);
+                app_control_set_iq_ref(0.0f);
+                HAL_Delay(300);
+                float m_before = encoder_get_angle_rad();
+                app_control_set_iq_ref(0.5f);
+                HAL_Delay(800);
+                app_control_set_iq_ref(0.0f);
+                float m_after = encoder_get_angle_rad();
+                results[step] = (m_after - m_before) * (180.0f / 3.14159265f);
+                HAL_Delay(400);
+            }
+            app_control_set_fine_offset(0.0f);
+            /* 直接发送，用足够长的超时 */
+            int n = snprintf(resp, sizeof(resp),
+                "[CMD] SWEEP 0:%+.0f|30:%+.0f|60:%+.0f|90:%+.0f|120:%+.0f|150:%+.0f|"
+                "180:%+.0f|210:%+.0f|240:%+.0f|270:%+.0f|300:%+.0f|330:%+.0f\r\n",
+                results[0], results[1], results[2], results[3],
+                results[4], results[5], results[6], results[7],
+                results[8], results[9], results[10], results[11]);
+            HAL_UART_Transmit(&huart3, (uint8_t*)resp, (uint16_t)n, 200);
+            rlen = 0; /* 已发送，不走 send_resp */
+        }
     }
 
     if (strcmp(line, "HTEST") == 0) {
@@ -236,6 +440,18 @@ static void cmd_process_line(char *line)
             rlen = snprintf(resp, sizeof(resp), "[CMD] SPD_MODE REF=%.1f dps\r\n", dps);
         } else { rlen = snprintf(resp, sizeof(resp), "[CMD] S: need numeric dps\r\n"); }
     }
+    else if (line[0] == 'T' && line[1] != '\0') {
+        /* 开环力矩：直接设 IqRef，绕过速度PI，用于隔离验证 */
+        float iq;
+        if (parse_float(line + 1, &iq)) {
+            if (iq > 0.45f) iq = 0.45f;
+            if (iq < -0.45f) iq = -0.45f;
+            app_control_set_speed_mode(false);   /* 关闭速度PI */
+            cmd_iq_ref = iq;
+            app_control_set_iq_ref(iq);
+            rlen = snprintf(resp, sizeof(resp), "[CMD] TORQUE IQ=%.3f A\r\n", iq);
+        } else { rlen = snprintf(resp, sizeof(resp), "[CMD] T: need current [A]\r\n"); }
+    }
     else if (line[0] == 'P') {
         float deg;
         if (parse_float(line + 1, &deg)) {
@@ -268,7 +484,7 @@ static bool parse_float(const char *s, float *out)
 
 static void cmd_feed_byte(uint8_t c)
 {
-    static const char IMMEDIATE[] = "edas+-][0";
+    static const char IMMEDIATE[] = "edas+-][0EOXL";
     if (rx_len == 0 && strchr(IMMEDIATE, (char)c)) {
         char line[2] = {(char)c, '\0'};
         cmd_process_line(line);
@@ -378,6 +594,7 @@ int main(void)
         mpu6050_update();
     }
 
+    openloop_stab_update();  /* 开环自稳 PD 控制（未激活时零开销）*/
     telemetry_update();
     /* USER CODE END WHILE */
 

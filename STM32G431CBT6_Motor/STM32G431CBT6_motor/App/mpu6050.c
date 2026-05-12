@@ -172,7 +172,7 @@ bool mpu6050_update(void)
 
     uint8_t buf[14];
     if (!reg_read(REG_ACCEL_XOUT, buf, 14)) {
-        if (++s_fail_cnt >= 5U) { s_fail_cnt = 0; s_ready = false; }
+        if (++s_fail_cnt >= 20U) { s_fail_cnt = 0; s_ready = false; }
         return false;
     }
     s_fail_cnt = 0;

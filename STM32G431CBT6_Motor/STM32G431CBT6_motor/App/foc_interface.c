@@ -76,6 +76,47 @@ static float     s_stat_sum_err = 0.0f;
 static FocDqStats_t s_dq_snap   = {0};
 static volatile bool s_dq_ready = false;
 
+/* ---- 开环强制换向 ---- */
+static volatile bool  s_openloop_active = false;
+static volatile float s_openloop_theta  = 0.0f;
+static volatile float s_openloop_omega  = 0.0f;
+static volatile float s_openloop_vq     = 0.0f;
+static volatile bool  s_pi_bypass       = false;
+#define OPENLOOP_DT  (1.0f / 20000.0f)
+
+/* ---- 开环期间编码器诊断 ---- */
+static volatile float s_calib_sum_plus  = 0.0f;  /* sum(theta_ol + raw_e) */
+static volatile float s_calib_sum_minus = 0.0f;  /* sum(theta_ol - raw_e) */
+static volatile uint32_t s_calib_cnt    = 0;
+static volatile float s_calib_enc_last  = 0.0f;  /* 最后一次编码器读数 */
+#define TWO_PI       (6.28318530f)
+
+/* ---- 强制闭环旋转（绕过编码器）---- */
+static volatile bool  s_forced_active = false;
+static volatile float s_forced_theta  = 0.0f;   /* 当前强制电角度 [rad] */
+static volatile float s_forced_omega  = 0.0f;   /* 电角速度 [rad/s] */
+
+void foc_interface_set_pi_bypass(bool on) { s_pi_bypass = on; }
+static volatile float s_bypass_vq = 0.0f;
+void foc_interface_set_bypass_vq(float vq) { s_bypass_vq = vq; }
+
+/* ---- 编码器角度预测器 ---- */
+static volatile float s_pred_raw_e_prev = 0.0f;   /* 上次编码器电角度 */
+static volatile float s_pred_omega_e   = 0.0f;    /* 估算电角速度 [rad/s] */
+static volatile uint32_t s_pred_age    = 0;        /* 自上次编码器更新后的ISR计数 */
+static volatile uint32_t s_pred_last_ms = 0;       /* 上次编码器捕获时间戳 [ms] */
+#define PRED_ALPHA  (0.3f)                          /* 速度IIR滤波系数 */
+#define PRED_MAX_AGE (200U)                         /* 最大外推200周期=10ms */
+
+void foc_forced_start(float elec_omega_rps) {
+    s_forced_theta = 0.0f;
+    s_forced_omega = elec_omega_rps;
+    s_forced_active = true;
+}
+void foc_forced_stop(void) {
+    s_forced_active = false;
+}
+
 /* ---------------------------------------------------------- */
 static inline uint32_t clamp_ccr(float duty_norm)
 {
@@ -109,8 +150,24 @@ void foc_interface_init(void)
 }
 
 /* ---------------------------------------------------------- */
+/* ISR 频率诊断 */
+static volatile uint32_t s_isr_count = 0;
+static volatile uint32_t s_isr_freq_hz = 0;
+static uint32_t s_isr_last_sec = 0;
+
+uint32_t foc_interface_get_isr_freq(void) { return s_isr_freq_hz; }
+
 void foc_interface_step(const uint16_t *adc_raw)
 {
+    /* ISR 频率测量 */
+    s_isr_count++;
+    uint32_t now_ms = HAL_GetTick();
+    if ((now_ms - s_isr_last_sec) >= 1000U) {
+        s_isr_freq_hz = s_isr_count;
+        s_isr_count = 0;
+        s_isr_last_sec = now_ms;
+    }
+
     /* 保存 ADC 原始快照（用于校准和故障检测）*/
     for (uint8_t i = 0; i < FOC_ADC_CH_COUNT; i++) {
         s_adc_raw_snap[i] = adc_raw[i];
@@ -154,14 +211,17 @@ void foc_interface_step(const uint16_t *adc_raw)
         iw = -(iu + iv);
     }
 
-    float vbus = ADC_TO_VBUS(adc_raw[FOC_ADC_IDX_VBUS]);
+    float vbus_adc = ADC_TO_VBUS(adc_raw[FOC_ADC_IDX_VBUS]);
+    /* 使用 ADC 实测值。分压比可能有误差，但比硬编码 12V 更接近真实。
+     * 之前 12V 硬编码导致占空比偏小 ~2.4x（实际 VBUS≈5V），严重限功率。 */
+    float vbus = (vbus_adc > 3.0f) ? vbus_adc : 12.0f;  /* 防 ADC 断线兜底 */
 
 
     /* 更新测量快照（所有模式都需要，保证遥测和保护看到实时值）*/
     s_meas_buf.iu_a      = iu;
     s_meas_buf.iv_a      = iv;
     s_meas_buf.iw_a      = iw;
-    s_meas_buf.vbus_v    = vbus;
+    s_meas_buf.vbus_v    = vbus_adc;  /* 遥测显示 ADC 读数，便于排查分压比 */
 
 #ifdef FOC_DBG_DUTY_TEST
     /* ==== 50% duty 旁路，验证 PWM/驱动 基础 ====
@@ -220,14 +280,112 @@ void foc_interface_step(const uint16_t *adc_raw)
         foc_controller_U.In_theta_e = 0.0f; foc_controller_U.In_iq_ref = 0.0f;
         foc_controller_U.In_V_bus = vbus;
         foc_controller_step();
+    } else if (s_openloop_active) {
+        /* ---- 开环强制换向：手动扫描电角度 ---- */
+        s_openloop_theta += s_openloop_omega * OPENLOOP_DT;
+        if (s_openloop_theta >= TWO_PI)  s_openloop_theta -= TWO_PI;
+        if (s_openloop_theta < 0.0f)     s_openloop_theta += TWO_PI;
+        elec_angle = s_openloop_theta;
+        s_meas_buf.angle_rad = elec_angle;
+        /* 直接用电压注入（SVPWM），不走电流PI */
+        float vq = s_openloop_vq;
+        float vd = 0.0f;
+        float cos_t = cosf(elec_angle);
+        float sin_t = sinf(elec_angle);
+        /* 反 Park: Valpha = Vd*cos - Vq*sin, Vbeta = Vd*sin + Vq*cos */
+        float va = vd * cos_t - vq * sin_t;
+        float vb = vd * sin_t + vq * cos_t;
+        /* 反 Clarke → 三相电压 */
+        float v_u = va;
+        float v_v = -0.5f * va + 0.866025f * vb;
+        float v_w = -0.5f * va - 0.866025f * vb;
+        /* SVPWM 中性点注入 */
+        float vn = -(fmaxf(fmaxf(v_u,v_v),v_w) + fminf(fminf(v_u,v_v),v_w)) / 2.0f;
+        float da = (v_u + vn) / vbus + 0.5f;
+        float db = (v_v + vn) / vbus + 0.5f;
+        float dc = (v_w + vn) / vbus + 0.5f;
+        foc_interface_write_ccr(da, db, dc);
+        /* 同步记录编码器（用于自动校准）*/
+        float raw_e_ol = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
+        s_calib_enc_last = raw_e_ol;
+        /* 用sin/cos平均避免角度wrapping问题 */
+        float diff = elec_angle - raw_e_ol;
+        float summ = elec_angle + raw_e_ol;
+        s_calib_sum_plus  += summ;
+        s_calib_sum_minus += diff;
+        s_calib_cnt++;
+        /* 重置 Simulink 积分器 */
+        foc_controller_U.In_reset = true;
+        foc_controller_U.In_I_a = iu; foc_controller_U.In_I_b = iv;
+        foc_controller_U.In_theta_e = elec_angle;
+        foc_controller_U.In_iq_ref = 0.0f;
+        foc_controller_U.In_V_bus = vbus;
+        foc_controller_step();
+    } else if (s_forced_active) {
+        /* ---- 强制闭环旋转：角度固定递增，PI控电流 ---- */
+        s_forced_theta += s_forced_omega * OPENLOOP_DT;
+        if (s_forced_theta >= TWO_PI)  s_forced_theta -= TWO_PI;
+        if (s_forced_theta < 0.0f)     s_forced_theta += TWO_PI;
+        elec_angle = s_forced_theta;
+        s_meas_buf.angle_rad = elec_angle;
+
+        foc_controller_U.In_I_a     = iu;
+        foc_controller_U.In_I_b     = iv;
+        foc_controller_U.In_theta_e = elec_angle;
+        foc_controller_U.In_iq_ref  = app_control_get_iq_ref();
+        foc_controller_U.In_V_bus   = vbus;
+        foc_controller_U.In_reset   = false;
+        foc_controller_step();
+        foc_interface_write_ccr(
+            foc_controller_Y.Out_duty_a,
+            foc_controller_Y.Out_duty_b,
+            foc_controller_Y.Out_duty_c
+        );
     } else {
-        /* 编码器方向测试版本: 直接使用 raw_e（不反转）
-         * 如果电机方向仍不对，再恢复 (2π - raw_e) 版本 */
+        /* ---- 正常闭环模式（带角度预测）---- */
         float raw_e  = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
         float offset = app_control_get_theta_offset();
-        elec_angle   = raw_e - offset;
-        while (elec_angle <  0.0f)               elec_angle += 2.0f * 3.14159265f;
-        while (elec_angle >= 2.0f * 3.14159265f) elec_angle -= 2.0f * 3.14159265f;
+        float fine   = app_control_get_fine_offset();
+
+        /* 用硬件捕获时间戳检测编码器是否真正更新 */
+        uint32_t enc_ms = encoder_get_last_capture_ms();
+        if (enc_ms != s_pred_last_ms && s_pred_last_ms != 0) {
+            /* 编码器有新数据——计算电角速度 */
+            uint32_t dt_ms = enc_ms - s_pred_last_ms;
+            if (dt_ms > 0 && dt_ms < 50) {  /* 合理范围 1-50ms */
+                float dt = (float)dt_ms * 0.001f;
+                float delta_e = raw_e - s_pred_raw_e_prev;
+                if (delta_e >  3.14159f) delta_e -= TWO_PI;
+                if (delta_e < -3.14159f) delta_e += TWO_PI;
+                float omega_new = delta_e / dt;
+                s_pred_omega_e = PRED_ALPHA * omega_new
+                               + (1.0f - PRED_ALPHA) * s_pred_omega_e;
+            }
+            s_pred_raw_e_prev = raw_e;
+            s_pred_last_ms = enc_ms;
+            s_pred_age = 0;
+        } else {
+            if (s_pred_last_ms == 0) {
+                s_pred_last_ms = enc_ms;
+                s_pred_raw_e_prev = raw_e;
+            }
+            s_pred_age++;
+            if (s_pred_age > PRED_MAX_AGE) {
+                s_pred_omega_e = 0.0f;
+            }
+        }
+
+        /* 线性预测：补偿编码器延迟
+         *
+         * 电角度方向约定：
+         *   对齐时 Vd=3V@θe=0 将转子 d 轴锁定到定子 α 轴。
+         *   编码器正向 = 电机磁场正向 → elec = raw_e - offset。
+         *   之前 offset - raw_e 的符号反了，导致 FOC 对电机旋转
+         *   施加反向制动转矩，电机被自己锁死。 */
+        float predicted_raw_e = raw_e + s_pred_omega_e * (float)s_pred_age * OPENLOOP_DT;
+        elec_angle = predicted_raw_e - offset + fine;
+        while (elec_angle <  0.0f)               elec_angle += TWO_PI;
+        while (elec_angle >= TWO_PI)              elec_angle -= TWO_PI;
 
         s_meas_buf.angle_rad = elec_angle;
 
@@ -238,11 +396,28 @@ void foc_interface_step(const uint16_t *adc_raw)
         foc_controller_U.In_V_bus   = vbus;
         foc_controller_U.In_reset   = (ctrl_state != STATE_RUN);
         foc_controller_step();
-        foc_interface_write_ccr(
-            foc_controller_Y.Out_duty_a,
-            foc_controller_Y.Out_duty_b,
-            foc_controller_Y.Out_duty_c
-        );
+        if (!s_pi_bypass) {
+            foc_interface_write_ccr(
+                foc_controller_Y.Out_duty_a,
+                foc_controller_Y.Out_duty_b,
+                foc_controller_Y.Out_duty_c
+            );
+        } else {
+            /* PI 旁路：用编码器角度 + 直接电压注入（完全绕过 Simulink）*/
+            float vq_bp = s_bypass_vq;
+            float cos_t = cosf(elec_angle);
+            float sin_t = sinf(elec_angle);
+            float va = -vq_bp * sin_t;
+            float vb =  vq_bp * cos_t;
+            float v_u = va;
+            float v_v = -0.5f * va + 0.866025f * vb;
+            float v_w = -0.5f * va - 0.866025f * vb;
+            float vn = -(fmaxf(fmaxf(v_u,v_v),v_w) + fminf(fminf(v_u,v_v),v_w)) / 2.0f;
+            float da = (v_u + vn) / vbus + 0.5f;
+            float db = (v_v + vn) / vbus + 0.5f;
+            float dc = (v_w + vn) / vbus + 0.5f;
+            foc_interface_write_ccr(da, db, dc);
+        }
         /* --- Clarke + Park → Id_meas / Iq_meas ---
          * Clarke: Ialpha = Ia,  Ibeta = (Ia + 2*Ib) / sqrt(3)
          * Park:   Id = Ialpha*cos(θ) + Ibeta*sin(θ)
@@ -348,4 +523,41 @@ bool foc_interface_get_dq_stats(FocDqStats_t *out)
     s_dq_ready = false;
     __set_PRIMASK(prim);
     return true;
+}
+
+/* ---- 开环测试接口 ---- */
+void foc_openloop_start(float elec_omega_rps, float vq_volt)
+{
+    s_openloop_theta = 0.0f;
+    s_openloop_omega = elec_omega_rps;
+    s_openloop_vq    = vq_volt;
+    s_calib_sum_plus = 0.0f;
+    s_calib_sum_minus = 0.0f;
+    s_calib_cnt = 0;
+    s_openloop_active = true;
+}
+
+void foc_openloop_stop(void)
+{
+    s_openloop_active = false;
+    s_openloop_omega  = 0.0f;
+    s_openloop_vq     = 0.0f;
+}
+
+bool foc_openloop_is_active(void)
+{
+    return s_openloop_active;
+}
+
+void foc_calib_get(float *avg_plus, float *avg_minus, uint32_t *cnt, float *enc_last)
+{
+    *cnt = s_calib_cnt;
+    if (s_calib_cnt > 0) {
+        *avg_plus  = s_calib_sum_plus  / (float)s_calib_cnt;
+        *avg_minus = s_calib_sum_minus / (float)s_calib_cnt;
+    } else {
+        *avg_plus = 0.0f;
+        *avg_minus = 0.0f;
+    }
+    *enc_last = s_calib_enc_last;
 }

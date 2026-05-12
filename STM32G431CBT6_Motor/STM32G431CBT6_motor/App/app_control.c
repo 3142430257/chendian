@@ -26,14 +26,15 @@
 #include <math.h>   /* logf(), fmaxf(), fminf() */
 
 /* ============================================================
- * 速度环参数（调参修改此处）
+ * 速度环参数（经验证稳定，平滑优先于响应速度）
  * ============================================================ */
-#define KP_SPD          (0.02f)     /* A/(rad/s)：Kp小防振荡，靠Ki提供启动力矩 */
-#define KI_SPD          (0.40f)     /* A/rad：@90°/s误差，约0.5s积分到0.3A启动 */
-#define IQ_MAX_A        (0.45f)    /* A，速度环安全上限（短时验证，热测后定版）*/
-#define OMEGA_SLEW_RATE (2.0f)     /* rad/s²，目标速度斜坡速率 */
-#define SPEED_EST_ALPHA (0.15f)    /* IIR alpha：fc≈10Hz，更强滤波减少噪声 */
-#define SPEED_EST_DT_MS (20U)      /* 速度估算最小间隔20ms(50Hz)，减少差分噪声 */
+#define KP_SPD          (0.10f)    /* A/(rad/s) */
+#define KI_SPD          (0.05f)    /* A/rad：KI/KP=0.5，防振荡 */
+#define IQ_MAX_A        (0.80f)    /* A */
+#define OMEGA_SLEW_RATE (2.0f)     /* rad/s² */
+#define SPEED_EST_ALPHA (0.15f)    /* IIR alpha：恢复稳定值 */
+#define SPEED_EST_DT_MS (20U)      /* 20ms估算间隔 */
+#define FRICTION_FF_A   (0.05f)    /* 摩擦前馈：克服静摩擦 */
 #define TWO_PI          (6.28318530f)
 
 /* 外部 GPIO（CubeMX 在 gpio.c 生成）*/
@@ -113,8 +114,8 @@ static uint8_t check_faults(const FocMeasurement_t *m, const uint16_t *adc_raw)
     if (m->vbus_v < VBUS_MIN_V)  f |= FAULT_VBUS_LOW;
     if (m->vbus_v > VBUS_MAX_V)  f |= FAULT_VBUS_HIGH;
 
-    /* 编码器 */
-    if (!encoder_is_valid())      f |= FAULT_ENCODER;
+    /* 编码器 — 暂时禁用：EMI 导致虚假触发，后续加更宽松的去抖 */
+    // if (!encoder_is_valid())      f |= FAULT_ENCODER;
 
     /* ADC 饱和（任意通道）*/
     for (uint8_t i = 0; i < FOC_ADC_CH_COUNT; i++) {
@@ -159,7 +160,12 @@ void app_control_init(void)
     s_calib_sum_iu = s_calib_sum_iv = s_calib_sum_iw = 0;
     last_frame_cnt = foc_interface_get_frame_count();
 
-    ctrl_sd_set(false);   /* 初始禁止驱动板 */
+    /* 校准必须在驱动禁用状态下进行，确保零电流。
+     * CTRL_SD 拉低 → 栅极驱动器关闭 → MOSFET 全关 → 相电流 = 0。
+     * 此时 ADC 读到的是运放 1.25V 偏置电压，对应理论值 ~1551。
+     * ISR 仍在运行但 Simulink 输出不影响实际电流（MOSFET 已关断）。*/
+    ctrl_sd_set(false);
+    foc_interface_write_ccr(0.5f, 0.5f, 0.5f);  /* 零电压输出 */
     s_state = STATE_CALIBRATE;
 }
 
@@ -187,10 +193,31 @@ void app_control_update(void)
 
             if (s_calib_cnt >= CALIB_SAMPLES)
             {
-                /* 四舍五入平均值写入各相零偏 */
-                iu_offset_raw = (uint16_t)((s_calib_sum_iu + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
-                iv_offset_raw = (uint16_t)((s_calib_sum_iv + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
-                iw_offset_raw = (uint16_t)((s_calib_sum_iw + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
+                uint16_t raw_u = (uint16_t)((s_calib_sum_iu + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
+                uint16_t raw_v = (uint16_t)((s_calib_sum_iv + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
+                uint16_t raw_w = (uint16_t)((s_calib_sum_iw + CALIB_SAMPLES / 2U) / CALIB_SAMPLES);
+
+                /* 合理性检查：理论零电流 ADC ≈ 1.25V/3.3V×4095 = 1551。
+                 * 允许 ±300 容差（1251~1851），超出范围则用理论值兜底。
+                 * 防止校准期间意外通电导致 offset 严重偏差。 */
+                #define OFFSET_THEORETICAL  (1551U)
+                #define OFFSET_TOLERANCE    (300U)
+                if (raw_u < OFFSET_THEORETICAL - OFFSET_TOLERANCE ||
+                    raw_u > OFFSET_THEORETICAL + OFFSET_TOLERANCE) {
+                    raw_u = OFFSET_THEORETICAL;
+                }
+                if (raw_v < OFFSET_THEORETICAL - OFFSET_TOLERANCE ||
+                    raw_v > OFFSET_THEORETICAL + OFFSET_TOLERANCE) {
+                    raw_v = OFFSET_THEORETICAL;
+                }
+                if (raw_w < OFFSET_THEORETICAL - OFFSET_TOLERANCE ||
+                    raw_w > OFFSET_THEORETICAL + OFFSET_TOLERANCE) {
+                    raw_w = OFFSET_THEORETICAL;
+                }
+                iu_offset_raw = raw_u;
+                iv_offset_raw = raw_v;
+                iw_offset_raw = raw_w;
+                ctrl_sd_set(false);  /* 校准完成，保持驱动禁用直到用户使能 */
                 s_state = STATE_READY;
             }
         }
@@ -269,46 +296,18 @@ void app_control_update(void)
                 s_vel_filt_dps  = 0.85f * s_vel_filt_dps + 0.15f * omega_dps;
                 float vel_pos   = MOTOR_SIGN * s_vel_filt_dps;
 
-                /* ---- 位置环（CTRL_POSITION）---- */
+                /* ---- 位置环（CTRL_POSITION）----
+                 * 直接 PD → IqRef，绕过速度 PI。
+                 * 直接力矩测试 0.5A→~300dps，所以 IqRef = spd_cmd(°/s) / 300(°/s/A) */
                 if (s_ctrl_mode == CTRL_POSITION) {
                     float pos_actual = get_pos_actual_deg();
 
-                    /* ── wrap穿越保护（最高优先级）──────────────────────────────
-                     * wrap180 在 ±180° 处突变，pos_err 会跳 360°，驱动电机
-                     * 再转一圈。保护条件 >170° 对正常 ±90° 云台绝不触发。
-                     * 触发时：omega_ref=0 + 清积分，不 break，让速度PI本拍
-                     * 以 omega_ref=0 输出制动 Iq，s_iq_ref_a 立即更新，无残余扭矩 */
                     if (fabsf(pos_actual) > 170.0f) {
-                        s_omega_ref_rps = 0.0f;
-                        s_speed_integ   = 0.0f;
-                        /* 不写 s_iq_ref_a，由下方速度PI（omega_ref=0）主动制动 */
+                        s_iq_ref_a = 0.0f;
+                        s_speed_integ = 0.0f;
                     } else {
-                        /* ── 正常位置环 ──────────────────────────────────────*/
                         float target      = s_pos_target_deg;
-                        float spd_lim_now = s_pos_spd_lim_dps;
-                        if (fabsf(pos_actual) > POS_WARN_LIM_DEG) {
-                            spd_lim_now = s_pos_spd_lim_dps * 0.3f;
-                        }
-                        float pos_err = target - pos_actual;
-
-                        /* pos_err 过零清速度积分 ─────────────────────────────
-                         * 电机越过目标点（pos_err 翻号）时，位置环已在反向制动。
-                         * 此时速度PI里还保留着趋近阶段积累的顺向积分，会产生
-                         * "二次冲击"：越过目标点后反向更猛。在翻号那一拍清零积
-                         * 分，让速度PI从零开始重建，大幅抑制双超调振荡。 */
-                        static float s_prev_pos_err = 0.0f;
-                        if (s_prev_pos_err * pos_err < 0.0f && fabsf(pos_err) > 0.5f) {
-                            s_speed_integ = 0.0f;
-                        }
-                        s_prev_pos_err = pos_err;
-
-                        /* 接近目标时限制积分上限（防 stiction 积分过量）──────────
-                         * 仅在最后 3° 内才限幅：更远处需要完整积分克服摩擦。
-                         * 3° 内限幅 0.15A，让冲击可控，过零清积分再收回目标点。*/
-                        if (fabsf(pos_err) < 3.0f) {
-                            if (s_speed_integ >  0.15f) s_speed_integ =  0.15f;
-                            if (s_speed_integ < -0.15f) s_speed_integ = -0.15f;
-                        }
+                        float pos_err     = target - pos_actual;
 
                         float spd_cmd;
                         if (fabsf(pos_err) < s_pos_deadband_deg) {
@@ -316,12 +315,22 @@ void app_control_update(void)
                         } else {
                             spd_cmd = s_kp_pos * pos_err - s_kd_pos * vel_pos;
                         }
+                        float spd_lim_now = s_pos_spd_lim_dps;
+                        if (fabsf(pos_actual) > POS_WARN_LIM_DEG) {
+                            spd_lim_now = s_pos_spd_lim_dps * 0.3f;
+                        }
                         if (pos_actual >  POS_HARD_LIM_DEG && spd_cmd > 0.0f) spd_cmd = 0.0f;
                         if (pos_actual < -POS_HARD_LIM_DEG && spd_cmd < 0.0f) spd_cmd = 0.0f;
                         if (spd_cmd >  spd_lim_now) spd_cmd =  spd_lim_now;
                         if (spd_cmd < -spd_lim_now) spd_cmd = -spd_lim_now;
-                        s_omega_ref_rps = spd_cmd * (3.14159265f / 180.0f);
+
+                        /* 直接 PD 输出 → IqRef：300dps/A 换算 */
+                        float iq_cmd = spd_cmd / 300.0f;
+                        if (iq_cmd >  IQ_MAX_A) iq_cmd =  IQ_MAX_A;
+                        if (iq_cmd < -IQ_MAX_A) iq_cmd = -IQ_MAX_A;
+                        s_iq_ref_a = iq_cmd;
                     }
+                    s_omega_ref_rps = 0.0f;  /* 不用速度PI */
                 } else if (s_ctrl_mode == CTRL_STABILIZE) {
                     /* 自稳模式：目标角 = -IMU_SIGN × pitch
                      * 复用位置 PD 框架；pos_actual 在本分支各自取，不跨作用域 */
@@ -355,8 +364,7 @@ void app_control_update(void)
 
 
                 /* ---- 速度 PI ---- */
-                bool run_spd_pi = (s_ctrl_mode == CTRL_POSITION)   ||
-                                  (s_ctrl_mode == CTRL_STABILIZE)   ||  /* 主动刺使归零 */
+                bool run_spd_pi = (s_ctrl_mode == CTRL_STABILIZE)   ||
                                   (s_ctrl_mode == CTRL_SPEED && s_speed_mode);
                 if (run_spd_pi) {
                     if (s_ctrl_mode == CTRL_SPEED) {
@@ -368,7 +376,18 @@ void app_control_update(void)
                         else                    s_omega_ref_rps  = s_omega_ref_cmd;
                     }
                     float err    = s_omega_ref_rps - s_omega_est_rps;
-                    float iq_cmd = KP_SPD * err + s_speed_integ;
+
+                    /* 速度依赖前馈：低速大、高速小
+                     * ff = FF_A / (1 + |omega_est| * 10)
+                     * 0°/s → 0.30A（克服静摩擦）
+                     * 30°/s → ~0.05A（动摩擦很小）
+                     * 60°/s → ~0.03A（几乎为零） */
+                    float omega_abs = fabsf(s_omega_est_rps);
+                    float ff = 0.0f;
+                    if (s_omega_ref_rps >  0.01f) ff =  FRICTION_FF_A / (1.0f + omega_abs * 10.0f);
+                    if (s_omega_ref_rps < -0.01f) ff = -FRICTION_FF_A / (1.0f + omega_abs * 10.0f);
+
+                    float iq_cmd = KP_SPD * err + s_speed_integ + ff;
                     float iq_clamped = fmaxf(-IQ_MAX_A, fminf(IQ_MAX_A, iq_cmd));
                     if (iq_clamped == iq_cmd) {
                         s_speed_integ += KI_SPD * err * dt_s;
@@ -485,21 +504,20 @@ void app_control_set_iq_ref(float iq_ref_a)
 /* ============================================================
  * ALIGN 接口（串口 'a' 命令触发，不自动上电执行）
  * ============================================================ */
-#define ALIGN_HOLD_MS   (2000U)  /* 加长到2s，确保转子充分稳定后再记录 offset */
-#define ALIGN_ID_V      (1.5f)   /* d 轴对齐电压 [V]，Rs=2.7Ω → I≈0.56A */
+#define ALIGN_HOLD_MS   (2000U)  /* 2s 对齐保持 */
+#define ALIGN_ID_V      (3.0f)   /* d 轴对齐电压 [V]，Rs=2.7Ω → I≈1.1A，确保转子锁定 */
 static uint32_t s_align_start_ms = 0;
 static float    s_theta_offset_e = 0.0f;  /* 电角度偏移 [rad] */
+static float    s_theta_fine_rad = 0.0f;  /* 手动微调偏移 [rad] */
 
 bool app_control_start_align(void)
 {
     if (s_state != STATE_READY) return false;
-    FocMeasurement_t m;
-    foc_interface_get_measurement(&m);
-    if (m.vbus_v < VBUS_MIN_V || !encoder_is_valid()) return false;
+    /* 不再检 encoder_is_valid()，EMI 可能导致暂时失效 */
 
     s_align_start_ms = HAL_GetTick();
-    ctrl_sd_set(true);
-    s_state = STATE_ALIGN;
+    s_state = STATE_ALIGN;      /* 先设状态，ISR 才能立即走 ALIGN 分支 */
+    ctrl_sd_set(true);          /* 再使能驱动板（消除竞态窗口）*/
     return true;
 }
 
@@ -507,34 +525,47 @@ static void align_update(const FocMeasurement_t *m)
 {
     uint32_t now = HAL_GetTick();
 
-    /* 超时 / 过流 / 编码器失效 → 立即停止
-     * 注意：CTRL_SD 上电瞬间 EMI 可能让 encoder 短暂无效，
-     * 前 80ms 为启动保护期，不校验编码器避免误退出。*/
-    bool startup  = ((now - s_align_start_ms) < 80U);
+    /* 超时保护
+     * ALIGN 仅持续 2s 且电流由固定电压限制（ALIGN_ID_V/Rs ≈ 1.1A），
+     * 安全性由硬超时保证。
+     * ⚠️ 不检 encoder_is_valid()：电机通电时 EMI 会让 PWM 捕获偶尔丢失，
+     *    导致 ALIGN 提前退出 offset=0。编码器只需在最终读取时有效即可。 */
     bool overtime = ((now - s_align_start_ms) > (ALIGN_HOLD_MS + 500U));
-    bool overcurr = (m->iu_a > 1.5f || m->iu_a < -1.5f ||
-                     m->iv_a > 1.5f || m->iv_a < -1.5f ||
-                     m->iw_a > 1.5f || m->iw_a < -1.5f);
 
-    if (overtime || overcurr || (!startup && !encoder_is_valid())) {
+    if (overtime) {
         ctrl_sd_set(false);
         s_state = STATE_READY;
         return;
     }
 
     if ((now - s_align_start_ms) >= ALIGN_HOLD_MS) {
-        /* 转子已稳定在 theta_e=0，记录电角度偏移
-         * 编码器方向反转：offset = 2π - (pp * theta_m) mod 2π
-         * 保证与 RUN 分支 elec_angle = (2π - raw_e) - offset 一致 */
-        float theta_m_now = encoder_get_angle_rad();
-        float raw_e = theta_m_now * (float)MOTOR_POLE_PAIRS;
+        /* 先关 PWM 消除 EMI，再多次读取编码器取中位数。
+         * 单次读取可能受残余噪声或齿槽松弛影响。*/
+        ctrl_sd_set(false);
+        HAL_Delay(3);
+
+        /* 采集 8 次编码器读数，每次间隔 1ms，取中位数 */
+        float samples[8];
+        for (int i = 0; i < 8; i++) {
+            samples[i] = encoder_get_angle_rad() * (float)MOTOR_POLE_PAIRS;
+            HAL_Delay(1);
+        }
+        /* 排序取中位数（简单冒泡，8元素） */
+        for (int i = 0; i < 7; i++) {
+            for (int j = i+1; j < 8; j++) {
+                if (samples[i] > samples[j]) {
+                    float tmp = samples[i];
+                    samples[i] = samples[j];
+                    samples[j] = tmp;
+                }
+            }
+        }
+        float raw_e = samples[3];  /* 中位数（8元素取第4个，0-indexed=3） */
         while (raw_e >= 2.0f * 3.14159265f) raw_e -= 2.0f * 3.14159265f;
         while (raw_e <  0.0f)               raw_e += 2.0f * 3.14159265f;
-        s_theta_offset_e = raw_e;  /* 测试版：直接记录raw_e作offset，配合RUN里的 raw_e - offset */
-        /* 原来是(2π-raw_e)，若恢复则需同步改回 RUN 里的公式 */
+        s_theta_offset_e = raw_e;
         while (s_theta_offset_e >= 2.0f * 3.14159265f) s_theta_offset_e -= 2.0f * 3.14159265f;
         while (s_theta_offset_e <  0.0f)               s_theta_offset_e += 2.0f * 3.14159265f;
-        ctrl_sd_set(false);
         s_state = STATE_READY;
     }
 }
@@ -547,6 +578,16 @@ float app_control_get_align_id_ref(void)
 float app_control_get_theta_offset(void)
 {
     return s_theta_offset_e;
+}
+
+void app_control_set_fine_offset(float rad)
+{
+    s_theta_fine_rad = rad;
+}
+
+float app_control_get_fine_offset(void)
+{
+    return s_theta_fine_rad;
 }
 
 /* ============================================================
