@@ -5,7 +5,7 @@
  *
  * Model version                  : 1.13
  * Simulink Coder version         : 24.2 (R2024b) 21-Jun-2024
- * C/C++ source code generated on : Tue Apr 21 17:03:24 2026
+ * C/C++ source code generated on : Wed May 13 09:15:59 2026
  *
  * Target selection: ert.tlc
  * Embedded hardware selection: ARM Compatible->ARM Cortex-M
@@ -65,15 +65,15 @@ void foc_controller_step(void)
   V_lim = foc_controller_U.In_V_bus / 1.73205078F;
   err_d = 0.0F - (ialpha * I_c + ibeta * sin_e);
   err_q = foc_controller_U.In_iq_ref - (-ialpha * sin_e + ibeta * I_c);
-  ialpha = 0.628318489F * err_d + foc_controller_DW.int_d;
-  ibeta = 0.628318489F * err_q + foc_controller_DW.int_q;
+  ialpha = 0.0376991108F * err_d + foc_controller_DW.int_d;
+  ibeta = 0.0376991108F * err_q + foc_controller_DW.int_q;
   v_mag = sqrtf(ialpha * ialpha + ibeta * ibeta);
   if (v_mag > V_lim) {
     ialpha = ialpha * V_lim / v_mag;
     ibeta = ibeta * V_lim / v_mag;
   } else {
-    foc_controller_DW.int_d += 0.424115032F * err_d;
-    foc_controller_DW.int_q += 0.424115032F * err_q;
+    foc_controller_DW.int_d += 0.0254469011F * err_d;
+    foc_controller_DW.int_q += 0.0254469011F * err_q;
   }
 
   V_lim = ialpha * I_c - ibeta * sin_e;

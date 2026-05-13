@@ -193,28 +193,56 @@ void foc_interface_step(const uint16_t *adc_raw)
     uint32_t ccr_b = __HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_2);
     uint32_t ccr_c = __HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_3);
 
+    /* ---- 低边电流重构（带滞回）----
+     *
+     * 低调制比（占空比≈50%）时三个 CCR 几乎相等，SVPWM 中性点注入
+     * 的微小波动会导致"最大相"在 U/V/W 间随机切换。每切换一次，
+     * 重构所用的物理采样组合就变一次，三相 shunt 的零点偏差被放大
+     * 为电流跳变 → Id/Iq 振荡 → 转矩脉动 → 噪声。
+     *
+     * 滞回：CCR 最大与次大差距 < ARR×2% 时，保持上一拍的选相。*/
+    #define CCR_HYST_THRESH  ((uint32_t)(TIM1_ARR * 0.02f))  /* ARR 的 2% */
+    static uint8_t s_last_phase = 0;  /* 0=U, 1=V, 2=W */
+
+    /* 三元素冒泡排序（ccr_a/b/c 降序 → idx[0]=max, idx[1]=mid, idx[2]=min）*/
+    uint32_t vals[3] = {ccr_a, ccr_b, ccr_c};
+    uint8_t  idx[3]  = {0, 1, 2};  /* 0=U, 1=V, 2=W */
+    if (vals[0] < vals[1]) { uint32_t tv = vals[0]; vals[0] = vals[1]; vals[1] = tv;
+                              uint8_t ti = idx[0];   idx[0] = idx[1];   idx[1] = ti; }
+    if (vals[1] < vals[2]) { uint32_t tv = vals[1]; vals[1] = vals[2]; vals[2] = tv;
+                              uint8_t ti = idx[1];   idx[1] = idx[2];   idx[2] = ti; }
+    if (vals[0] < vals[1]) { uint32_t tv = vals[0]; vals[0] = vals[1]; vals[1] = tv;
+                              uint8_t ti = idx[0];   idx[0] = idx[1];   idx[1] = ti; }
+
+    uint8_t driven_phase;
+    if ((vals[0] - vals[1]) < CCR_HYST_THRESH) {
+        driven_phase = s_last_phase;  /* 差距太小，保持上一拍 */
+    } else {
+        driven_phase = idx[0];        /* 正常选最大 CCR 相 */
+        s_last_phase = idx[0];
+    }
+
     float iu, iv, iw;
-    if (ccr_a >= ccr_b && ccr_a >= ccr_c) {
-        /* U 相驱动（CCR最大），IU 采样无效，从 IV/IW 重构 */
+    if (driven_phase == 0) {
+        /* U 相驱动（CCR 最大），IU 采样不可靠，从 IV/IW 重构 */
         iv = -iv_shunt;
         iw = -iw_shunt;
         iu = -(iv + iw);
-    } else if (ccr_b >= ccr_a && ccr_b >= ccr_c) {
-        /* V 相驱动，IV 采样无效，从 IU/IW 重构 */
+    } else if (driven_phase == 1) {
+        /* V 相驱动，IV 采样不可靠，从 IU/IW 重构 */
         iu = -iu_shunt;
         iw = -iw_shunt;
         iv = -(iu + iw);
     } else {
-        /* W 相驱动，IW 采样无效，从 IU/IV 重构 */
+        /* W 相驱动，IW 采样不可靠，从 IU/IV 重构 */
         iu = -iu_shunt;
         iv = -iv_shunt;
         iw = -(iu + iv);
     }
 
     float vbus_adc = ADC_TO_VBUS(adc_raw[FOC_ADC_IDX_VBUS]);
-    /* 使用 ADC 实测值。分压比可能有误差，但比硬编码 12V 更接近真实。
-     * 之前 12V 硬编码导致占空比偏小 ~2.4x（实际 VBUS≈5V），严重限功率。 */
-    float vbus = (vbus_adc > 3.0f) ? vbus_adc : 12.0f;  /* 防 ADC 断线兜底 */
+    float vbus = 12.0f;  /* 实际电源电压 */
+    (void)vbus_adc;
 
 
     /* 更新测量快照（所有模式都需要，保证遥测和保护看到实时值）*/
@@ -389,8 +417,16 @@ void foc_interface_step(const uint16_t *adc_raw)
 
         s_meas_buf.angle_rad = elec_angle;
 
-        foc_controller_U.In_I_a     = iu;
-        foc_controller_U.In_I_b     = iv;
+        /* 低通滤波电流测量值，抑制高频噪声导致的 PI 振荡。
+         * α=0.2 → 时间常数 ~5 采样点(250μs)，远小于电流环响应时间。 */
+        static float s_iu_filt = 0.0f, s_iv_filt = 0.0f;
+        static bool  s_filt_init = false;
+        if (!s_filt_init) { s_iu_filt = iu; s_iv_filt = iv; s_filt_init = true; }
+        s_iu_filt = 0.2f * iu + 0.8f * s_iu_filt;
+        s_iv_filt = 0.2f * iv + 0.8f * s_iv_filt;
+
+        foc_controller_U.In_I_a     = s_iu_filt;
+        foc_controller_U.In_I_b     = s_iv_filt;
         foc_controller_U.In_theta_e = elec_angle;
         foc_controller_U.In_iq_ref  = app_control_get_iq_ref();
         foc_controller_U.In_V_bus   = vbus;

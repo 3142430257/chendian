@@ -21,11 +21,11 @@ Ts_ctrl   = single(Ts);     % 控制器内部用 [s] (single, 给 PI 积分计�
 % -- 3. 系统零位偏差 --
 theta_offset = single(0.0); % 机械角零点偏差 [rad]
 
-% -- 4. 电流环 PI 参数（极点配置法, 带宽 2kHz）--
-f_bw  = 500;                           % 电流环带宽 [Hz]（先保守，稳定后再提）
+% -- 4. 电流环 PI 参数（极点配置法, 带宽 100Hz，验证稳定性）--
+f_bw  = 30;                            % 电流环带宽 [Hz]（极保守，优先稳定性）
 wc    = 2*pi*f_bw;
-Kp_d  = single(Ld * wc);               % d轴 Kp = Ld * wc ≈ 2.51
-Ki_d  = single(Rs * wc);               % d轴 Ki = Rs * wc ≈ 3770
+Kp_d  = single(Ld * wc);               % d轴 Kp = Ld * wc ≈ 0.126
+Ki_d  = single(Rs * wc);               % d轴 Ki = Rs * wc ≈ 1696
 Kp_q  = single(Lq * wc);               % q轴 Kp
 Ki_q  = single(Rs * wc);               % q轴 Ki
 id_ref = single(0.0);                  % d轴电流参考 [A] (SPM: id=0)
