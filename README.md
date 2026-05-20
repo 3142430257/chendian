@@ -1,140 +1,111 @@
-# FOC Motor Controller (STM32G431CBT6)
+# STM32G431 FOC 云台自稳系统
 
-基于 Simulink + Embedded Coder 的 **FOC（磁场定向控制）** 无刷电机驱动项目，目标驱动 **GM3506** 云台无刷电机。
+基于 STM32G431CBT6 + GM3506 无刷电机的**单轴云台姿态自稳**系统。
 
-## 项目概述
+全国大学生嵌入式芯片与系统设计竞赛 2026 · 意法半导体赛道 · 选题四：工业 4.0/电机控制/机器人
 
-- **控制策略**：闭环矢量控制（FOC），包含电流环 / 速度环 / 位置环
-- **电流检测**：双电阻采样 + 重构算法
-- **编码器**：SPI 磁编码器（AS5047P 兼容）
-- **PWM**：SVPWM（空间矢量脉宽调制），20 kHz
-- **支持模式**：速度模式、位置模式、自稳模式（IMU）
-- **自动保护**：过流保护、低压保护、过温保护、编码器断线检测
+## 功能演示
+
+| 功能 | 命令序列 | 效果 |
+|---|---|---|
+| 闭环速度控制 | `a → e → S40 → S-40 → S100 → S0 → d` | 电机按指定速度正反转 |
+| 云台自稳 | `a → e → H → G` | 倾斜底座时负载臂保持水平 |
+
+## 系统架构
+
+```
+IMU (MPU6050) ──→ 位置目标 ──→ ISR 级 PID ──→ IqRef ──→ 电流环 (Simulink PI) ──→ SVPWM ──→ 电机
+                                    ↑                                                    ↓
+                              编码器 (AS5048A SPI) ←──────────────────────────────────── GM3506
+```
+
+- **电流环**：Simulink 生成 PI 控制器，20kHz ISR 执行
+- **位置环**：ISR 级 PID（1kHz 编码器更新率），非线性 KP + 积分消除重力静差
+- **ALIGN**：旋转式校准（openloop 采样 + π/2 修正 + Iq 脉冲方向验证）
+- **自稳**：IMU pitch → 位置目标，电机反向补偿保持水平
+
+## 硬件
+
+| 组件 | 型号 |
+|---|---|
+| MCU | STM32G431CBT6 (Cortex-M4, 170MHz) |
+| 电机 | GM3506 无刷云台电机 (11 极对) |
+| 驱动板 | ATK-PD6010B |
+| 编码器 | AS5048A (14bit SPI 磁编码器) |
+| IMU | MPU6050 (I2C) |
+| 电源 | 12V DC |
 
 ## 目录结构
 
 ```
-├── foc_controller.slx       # Simulink 控制器模型（电流环 PI + SVPWM）
-├── foc_sim.slx              # Simulink 闭环仿真模型（电机 + 控制器）
-├── foc_params.m             # 全局参数文件（电机参数 / PI 参数）
-├── foc_monitor.py           # Python 串口实时诊断工具
-├── foc_closedloop.png       # 闭环仿真波形截图
-├── foc_stall_test.png       # 堵转测试波形
-├── foc_verified_final.png   # 最终验证波形
-├── cubemx_out/              # STM32CubeMX 工程（STM32G431CBT6）
-├── foc_controller_ert_rtw/  # Simulink Coder 生成的 ERT 代码
-├── STM32G431CBT6_Motor/     # STM32CubeIDE / 固件工程
-├── 原理图&封装/              # 原理图 PDF + PCB 封装
-├── gimbal_mount/            # 云台支架 3D 打印 STL 文件
-├── schema_p1.png            # 原理图第1页截图
-├── schema_p2.png            # 原理图第2页截图
-└── ATK-PD6010B_V1.0.pdf     # 驱动器参考手册
+├── STM32G431CBT6_Motor/     # 固件工程（CMake 构建）
+│   └── App/                 # 应用层代码
+│       ├── app_control.c    # 状态机 + 位置跟踪 + 自稳逻辑
+│       ├── foc_interface.c  # ISR：电流环 + ISR级PID + 安全保护
+│       ├── foc_controller.c # Simulink 生成的电流环 PI
+│       ├── encoder_spi.c    # AS5048A SPI 驱动 + 速度估计
+│       ├── mpu6050.c        # IMU 驱动
+│       └── telemetry.c      # 串口遥测 (100Hz)
+├── cubemx_out/              # STM32CubeMX 工程
+├── foc_controller_ert_rtw/  # Simulink Coder 生成代码
+├── foc_controller.slx       # Simulink 电流环模型
+├── foc_sim.slx              # 闭环仿真模型
+├── foc_params.m             # 电机/PI 参数
+├── tmp/foc_ctl.py           # 串口控制 + watchdog 工具
+├── gimbal_mount/            # 3D 打印支架 STL
+└── 原理图&封装/              # 硬件设计文档
 ```
-
-## 硬件平台
-
-| 组件       | 型号 / 参数                 |
-| ---------- | --------------------------- |
-| MCU        | STM32G431CBT6 (Cortex-M4)   |
-| 电机       | GM3506 无刷云台电机 (11极对) |
-| 驱动器     | ATK-PD6010B                 |
-| 编码器     | 14位 SPI 磁编码器           |
-| 母线电压   | 12V                         |
-| PWM 频率   | 20 kHz                      |
-| 控制周期   | 50 μs                       |
 
 ## 快速开始
 
-### 1. Simulink 仿真
+### 编译烧录
 
-1. 打开 MATLAB（R2024b 或更新版本）
-2. 在 MATLAB 中切换到项目根目录
-3. 运行 `foc_params` 加载全局参数
-4. 打开 `foc_sim.slx`，点击 **Run** 运行仿真
-5. 查看波形结果
+```powershell
+cmake --build STM32G431CBT6_Motor\STM32G431CBT6_motor\build\Debug
 
-### 2. Python 诊断工具
-
-```bash
-# 安装依赖
-pip install pyserial
-
-# 运行（默认 COM11, 115200）
-python foc_monitor.py
-
-# 指定串口和波特率
-python foc_monitor.py COM5 921600
+& 'D:\STM32CubeCLT_1.21.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe' `
+  -c port=SWD mode=UR reset=HWrst `
+  -w 'STM32G431CBT6_Motor\STM32G431CBT6_motor\build\Debug\STM32G431CBT6_motor.elf' `
+  -v -rst
 ```
 
-**命令列表：**
-
-| 命令 | 功能             |
-| ---- | ---------------- |
-| `a`  | 校准 (ALIGN)     |
-| `e`  | 使能 (ENABLE)    |
-| `d`  | 停止 (DISABLE)   |
-| `+`  | Iq 参考 +0.05A   |
-| `-`  | Iq 参考 -0.05A   |
-| `]`  | 速度 +30°/s      |
-| `[`  | 速度 -30°/s      |
-| `0`  | 速度归零         |
-| `s`  | 查询状态         |
-| `G`  | 自稳模式         |
-| `H`  | 回零（同步IMU零点）|
-| `q`  | 退出             |
-
-### 3. 固件编译与烧录
-
-使用 STM32CubeIDE 或 CMake：
+### 串口控制
 
 ```bash
-cd STM32G431CBT6_Motor
-# 导入到 STM32CubeIDE，编译后烧录
+python tmp/foc_ctl.py run "d:1;a:4.5;e:0.3;H:0.5;G:30;d:0.5"
 ```
 
-或使用 CubeMX 重新生成：
+### 命令列表
 
-```bash
-# 打开 cubemx_out/cubemx_out.ioc
-# 生成代码后编译烧录
-```
-
-## 电机参数
-
-| 参数         | 值          |
-| ------------ | ----------- |
-| 极对数 (p)   | 11          |
-| 相电阻 (Rs)  | 2.7 Ω       |
-| d轴电感 (Ld) | 0.2 mH      |
-| q轴电感 (Lq) | 0.2 mH      |
-| 磁链 (Ψf)    | 0.01 Wb     |
-| 转动惯量 (J) | 1×10⁻⁵ kg·m²|
+| 命令 | 功能 |
+|---|---|
+| `a` | 旋转式电角度校准 (ALIGN) |
+| `e` | 使能 RUN 模式 |
+| `d` | 停机 |
+| `H` | 设当前位置为零点 (Home) |
+| `G` | 启动 IMU 自稳模式 |
+| `S<dps>` | 速度模式（如 S40 = 40°/s） |
+| `I<A>` | 直接力矩注入（如 I0.15） |
+| `O` | 开环旋转测试 |
+| `X` | 停止开环 |
+| `F<deg>` | 手动微调电角度偏移 |
 
 ## 控制参数
 
-| 参数          | 值         |
-| ------------- | ---------- |
-| 电流环带宽    | 500 Hz     |
-| Kp_d (d轴)    | ~2.51      |
-| Ki_d (d轴)    | ~3770      |
-| Kp_q (q轴)    | ~2.51      |
-| Ki_q (q轴)    | ~3770      |
-| SVPWM 电压上限 | Vbus/√3    |
-
-## 3D 打印件
-
-`gimbal_mount/` 目录包含云台支架的 STL 模型：
-
-- `motor_back_mount.stl` — 电机后支架
-- `motor_shaft_clamp.stl` — 轴夹
-- `rotor_arm.stl` — 转子臂
-- `修复-motor_back_mount.stl` — 修复版后支架
+| 参数 | 值 | 说明 |
+|---|---|---|
+| 电流环带宽 | 200 Hz | Simulink PI |
+| ISR_KP_NEAR | 0.015 A/deg | 位置误差 <10° |
+| ISR_KP_FAR | 0.030 A/deg | 位置误差 >10° |
+| ISR_KD | 0.010 A/(deg/s) | 阻尼 |
+| ISR_KI | 0.0005 A/(deg·s) | 积分消除重力静差 |
+| 速度保护 | 400°/s | ISR 级切断力矩 |
 
 ## 依赖
 
-- **MATLAB R2024b** + Simulink + Simulink Coder + Embedded Coder
-- **STM32CubeMX / STM32CubeIDE**
-- **Python 3.8+** + `pyserial`
+- STM32CubeCLT (含 arm-none-eabi-gcc + STM32CubeProgrammer)
+- Python 3 + pyserial
+- MATLAB R2024b + Simulink + Embedded Coder（仅修改电流环时需要）
 
 ## 许可证
 
