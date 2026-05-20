@@ -28,14 +28,21 @@
 /* ============================================================
  * 速度环参数（经验证稳定，平滑优先于响应速度）
  * ============================================================ */
-#define KP_SPD          (0.10f)    /* A/(rad/s) */
-#define KI_SPD          (0.05f)    /* A/rad：KI/KP=0.5，防振荡 */
-#define IQ_MAX_A        (1.00f)    /* A */
-#define OMEGA_SLEW_RATE (2.0f)     /* rad/s² */
-#define SPEED_EST_ALPHA (0.15f)    /* IIR alpha：恢复稳定值 */
-#define SPEED_EST_DT_MS (20U)      /* 20ms估算间隔 */
-#define FRICTION_FF_A   (0.05f)    /* 摩擦前馈：克服静摩擦 */
-#define TWO_PI          (6.28318530f)
+#define KP_SPD          (0.30f)    /* A/(rad/s) - 大 KP 提供强制动 */
+#define KI_SPD          (0.020f)   /* 积分克服齿槽 */
+#define IQ_MAX_A        (0.25f)    /* A - 限制最大力矩防飞 */
+#define IQ_SLEW_RATE_A_S (2.00f)   /* 不限制 */
+#define SPEED_FF_GAIN   (0.0f)     /* 关闭前馈 */
+#define SPEED_INTEG_MAX (0.20f)    /* 积分上限 */
+#define OMEGA_SLEW_RATE (50.0f)    /* 不限制 */
+#define FRICTION_FF_A   (0.0f)     /* 关闭 friction */
+#define START_BOOST_A   (0.0f)     /* 关闭 boost */
+#define START_BOOST_MS  (0U)
+#define START_DONE_RPS  (0.10f)
+#define STOP_DAMP_GAIN  (0.050f)
+#define STOP_DAMP_MAX_A (0.15f)
+#define STOP_DAMP_ON_RPS (0.20f)
+#define ENC_TORQUE_HOLD_MS (25U)
 
 /* 外部 GPIO（CubeMX 在 gpio.c 生成）*/
 extern void MX_GPIO_Init(void);  /* 仅供参考，实际已由 main 调用 */
@@ -48,13 +55,13 @@ static uint8_t    s_fault = FAULT_NONE;
 static volatile float s_iq_ref_a = 0.0f;  /* q轴目标电流 [A]，主循环写、ISR 读 */
 
 /* --- 速度环状态 --- */
-static float    s_theta_prev_rad = 0.0f;   /* 上次机械角 [rad] */
-static uint32_t s_est_prev_ms    = 0;      /* 上次估算时刻 [ms] */
 static float    s_omega_est_rps  = 0.0f;   /* 滤波后速度 [rad/s] */
 static float    s_omega_ref_rps  = 0.0f;   /* 经斜坡后的速度目标 [rad/s] */
 static float    s_omega_ref_cmd  = 0.0f;   /* 用户目标（未经斜坡）[rad/s] */
 static float    s_speed_integ    = 0.0f;   /* PI 积分项 */
 static bool     s_speed_mode     = false;  /* true=速度模式, false=力矩模式 */
+static uint32_t s_start_boost_until_ms = 0;
+static float    s_start_boost_sign     = 0.0f;
 
 /* --- 位置环状态 --- */
 static CtrlMode_t s_ctrl_mode           = CTRL_SPEED;
@@ -70,7 +77,7 @@ static float      s_imu_home_offset_deg  = 0.0f;  /* IMU pitch 安装偏置，H 
 
 /* 对齐 */
 static float    s_theta_offset_e = 0.0f;  /* 电角度偏移 [rad] */
-static float    s_theta_fine_rad = 0.0f;  /* 手动微调偏移 [rad] */
+static float    s_theta_fine_rad = 0.0f;  /* 手动微调偏移 [rad]（默认0，调试用 F 命令）*/
 static bool     s_align_need_verify = false;
 
 /* 零偏采样窗口 */
@@ -83,6 +90,8 @@ static uint32_t last_frame_cnt = 0;
 
 /* 前向声明（定义在文件尾部）*/
 static void align_update(const FocMeasurement_t *m);
+static void set_iq_ref_internal(float iq_ref_a);
+static void set_iq_ref_slewed(float iq_ref_a, float dt_s);
 
 /* ── 位置环抖助函数 ── */
 
@@ -160,7 +169,7 @@ void app_control_init(void)
 {
     s_state      = STATE_INIT;
     s_fault      = FAULT_NONE;
-    s_iq_ref_a   = 0.0f;      /* 确保上电时 Iq 指令为零 */
+    set_iq_ref_internal(0.0f);      /* 确保上电时 Iq 指令为零 */
     s_calib_cnt  = 0;
     s_calib_sum_iu = s_calib_sum_iv = s_calib_sum_iw = 0;
     last_frame_cnt = foc_interface_get_frame_count();
@@ -269,7 +278,7 @@ void app_control_update(void)
             }
             if (fault_consec >= FAULT_DEBOUNCE_CNT) {
                 s_fault = f_now;
-                s_iq_ref_a = 0.0f;
+                set_iq_ref_internal(0.0f);
                 ctrl_sd_set(false);
                 s_state = STATE_FAULT;
                 fault_consec = 0;
@@ -279,32 +288,57 @@ void app_control_update(void)
             fault_consec = 0;
             last_fault   = FAULT_NONE;
         }
-        /* ---- 速度估算 + 位置环 + 速度 PI ---- */
+        /* ---- 编码器速度 + 位置环 + 速度 PI ---- */
         {
-            float   theta_now = encoder_get_angle_rad();
-            uint32_t now_ms   = HAL_GetTick();
-            uint32_t dt_ms    = now_ms - s_est_prev_ms;
+            if ((HAL_GetTick() - encoder_get_last_capture_ms()) > ENC_TORQUE_HOLD_MS) {
+                s_omega_est_rps = 0.0f;
+                s_vel_filt_dps  = 0.0f;
+                s_speed_integ   = 0.0f;
+                set_iq_ref_internal(0.0f);
+                break;
+            }
 
-            if (dt_ms >= SPEED_EST_DT_MS) {
-                float dt_s    = dt_ms * 1e-3f;
-                float d_theta = theta_now - s_theta_prev_rad;
-                /* 角度展开（防止 0→2π 跳变） */
-                if (d_theta >  3.14159265f) d_theta -= TWO_PI;
-                if (d_theta < -3.14159265f) d_theta += TWO_PI;
+            /* ---- 即时速度保护（每次主循环都执行）----
+             * 不依赖慢速估计，直接看编码器角度变化。
+             * 如果瞬时速度超过 5 rad/s（286°/s），立刻清零力矩+积分。 */
+            {
+                static float s_prev_angle_rad = 0.0f;
+                static uint32_t s_prev_angle_ms = 0;
+                float cur_angle = encoder_get_angle_rad();
+                uint32_t cur_ms = HAL_GetTick();
+                uint32_t dt_prot = cur_ms - s_prev_angle_ms;
+                if (dt_prot >= 5U && dt_prot < 100U) {
+                    float da = cur_angle - s_prev_angle_rad;
+                    if (da >  3.14159265f) da -= 6.28318530f;
+                    if (da < -3.14159265f) da += 6.28318530f;
+                    float inst_spd = da / ((float)dt_prot * 1e-3f);
+                    if (fabsf(inst_spd) > 5.0f) {
+                        /* 速度过大，紧急制动 */
+                        s_speed_integ = 0.0f;
+                        set_iq_ref_internal(0.0f);
+                        s_prev_angle_rad = cur_angle;
+                        s_prev_angle_ms = cur_ms;
+                        break;  /* 跳过本拍速度环 */
+                    }
+                    s_prev_angle_rad = cur_angle;
+                    s_prev_angle_ms = cur_ms;
+                }
+            }
 
-                float omega_raw = d_theta / dt_s;
-                if (omega_raw >  30.0f) omega_raw =  30.0f;
-                if (omega_raw < -30.0f) omega_raw = -30.0f;
-                s_omega_est_rps = SPEED_EST_ALPHA * omega_raw
-                                + (1.0f - SPEED_EST_ALPHA) * s_omega_est_rps;
+            /* 速度环节拍：只在 dt >= 10ms 时执行，避免高频主循环
+             * 对过时速度估计反复积分导致振荡 */
+            uint32_t now_ms = HAL_GetTick();
+            static uint32_t s_speed_loop_prev_ms = 0;
+            uint32_t dt_ms_loop = now_ms - s_speed_loop_prev_ms;
+            if (dt_ms_loop < 10U) break;  /* 不到 10ms 不执行速度环 */
+            float dt_s = (float)dt_ms_loop * 1e-3f;
+            s_speed_loop_prev_ms = now_ms;
+            if (dt_s > 0.1f) dt_s = 0.1f;  /* 防异常长间隔 */
 
-                s_theta_prev_rad = theta_now;
-                s_est_prev_ms    = now_ms;
-
-                /* ---- D 项速度滤波（°/s，与 pos_actual 坐标一致）---- */
-                float omega_dps = s_omega_est_rps * (180.0f / 3.14159265f);
-                s_vel_filt_dps  = 0.85f * s_vel_filt_dps + 0.15f * omega_dps;
-                float vel_pos   = MOTOR_SIGN * s_vel_filt_dps;
+            s_omega_est_rps = encoder_get_omega_rad_s();
+            float omega_dps = s_omega_est_rps * (180.0f / 3.14159265f);
+            s_vel_filt_dps  = 0.85f * s_vel_filt_dps + 0.15f * omega_dps;
+            float vel_pos   = MOTOR_SIGN * s_vel_filt_dps;
 
                 /* ---- 位置环（CTRL_POSITION）----
                  * 直接 PD → IqRef，绕过速度 PI。
@@ -313,7 +347,7 @@ void app_control_update(void)
                     float pos_actual = get_pos_actual_deg();
 
                     if (fabsf(pos_actual) > 170.0f) {
-                        s_iq_ref_a = 0.0f;
+                        set_iq_ref_internal(0.0f);
                         s_speed_integ = 0.0f;
                     } else {
                         float target      = s_pos_target_deg;
@@ -338,7 +372,7 @@ void app_control_update(void)
                         float iq_cmd = spd_cmd / 300.0f;
                         if (iq_cmd >  IQ_MAX_A) iq_cmd =  IQ_MAX_A;
                         if (iq_cmd < -IQ_MAX_A) iq_cmd = -IQ_MAX_A;
-                        s_iq_ref_a = iq_cmd;
+                        set_iq_ref_internal(iq_cmd);
                     }
                     s_omega_ref_rps = 0.0f;  /* 不用速度PI */
                 } else if (s_ctrl_mode == CTRL_STABILIZE) {
@@ -373,48 +407,58 @@ void app_control_update(void)
                 }
 
 
-                /* ---- 速度控制：前馈 + 比例（无积分，无 IIR 滤波）----
+                /* ---- 速度控制：位置跟踪模式 ----
+                 * 不用速度 PI。把速度命令转成匀速递增的位置目标，
+                 * 用位置 PD 控制器跟踪。消除速度估计噪声导致的抖动。
                  *
-                 * 直接力矩测试标定：0.5A → ~300dps = 5.24 rad/s
-                 * 前馈系数 K_FF = 0.5/5.24 ≈ 0.095 A/(rad/s)
-                 *
-                 * IqRef = K_FF * ω_ref + KP * (ω_ref - ω_raw)
-                 *
-                 * ω_raw 直接从编码器角度差计算，不经 IIR 滤波。
-                 * 不用积分——前馈已提供大部分力矩，比例仅做微调。*/
+                 * IqRef = KP_TRK * pos_err - KD_TRK * vel_est
+                 * pos_target += omega_ref * dt
+                 */
+                #define KP_TRK   (0.006f)   /* A/deg — 很软的弹簧，不振荡 */
+                #define KD_TRK   (0.005f)   /* A/(deg/s) — 重阻尼 */
+                #define IQ_TRK_MAX (0.30f)  /* A — 限制力矩防甩 */
+                #define POS_ERR_MAX_DEG (10.0f)  /* 缩小误差限制 */
+
                 bool run_spd = (s_ctrl_mode == CTRL_STABILIZE)   ||
                                (s_ctrl_mode == CTRL_SPEED && s_speed_mode);
                 if (run_spd) {
                     if (s_ctrl_mode == CTRL_SPEED) {
-                        float delta = s_omega_ref_cmd - s_omega_ref_rps;
-                        float step  = OMEGA_SLEW_RATE * dt_s;
-                        if      (delta >  step) s_omega_ref_rps += step;
-                        else if (delta < -step) s_omega_ref_rps -= step;
-                        else                    s_omega_ref_rps  = s_omega_ref_cmd;
+                        float pos_actual = get_pos_actual_deg();
+                        float omega_dps_cmd = s_omega_ref_cmd * (180.0f / 3.14159265f);
+
+                        /* S0 时停止：目标锁定到当前位置 */
+                        if (fabsf(s_omega_ref_cmd) < 0.05f) {
+                            s_pos_target_deg = pos_actual;
+                        } else {
+                            /* 计算误差时处理 wrap：把误差限制在 ±180° 内 */
+                            float err_now = s_pos_target_deg - pos_actual;
+                            while (err_now >  180.0f) err_now -= 360.0f;
+                            while (err_now < -180.0f) err_now += 360.0f;
+
+                            /* 只在误差小于限制时递增目标 */
+                            if (fabsf(err_now) < POS_ERR_MAX_DEG) {
+                                s_pos_target_deg += omega_dps_cmd * dt_s;
+                            }
+                            /* 防止 target 无限增长：wrap 到 ±360° 范围 */
+                            while (s_pos_target_deg >  360.0f) s_pos_target_deg -= 360.0f;
+                            while (s_pos_target_deg < -360.0f) s_pos_target_deg += 360.0f;
+                        }
                     }
 
-                    /* 瞬时速度 + 硬限幅防 EMI 毛刺 */
-                    float omega_raw = d_theta / dt_s;
-                    if (omega_raw >  10.0f) omega_raw =  10.0f;
-                    if (omega_raw < -10.0f) omega_raw = -10.0f;
+                    float pos_actual = get_pos_actual_deg();
+                    float pos_err = s_pos_target_deg - pos_actual;
+                    /* wrap 误差到 ±180° */
+                    while (pos_err >  180.0f) pos_err -= 360.0f;
+                    while (pos_err < -180.0f) pos_err += 360.0f;
 
-                    /* 前馈 + 比例 + 积分 */
-                    float ff     = s_omega_ref_rps * 0.15f;
-                    float err    = s_omega_ref_rps - omega_raw;
-                    float iq_cmd = ff + 0.02f * err + s_speed_integ;
+                    /* 限制误差防止力矩过大 */
+                    if (pos_err >  POS_ERR_MAX_DEG) pos_err =  POS_ERR_MAX_DEG;
+                    if (pos_err < -POS_ERR_MAX_DEG) pos_err = -POS_ERR_MAX_DEG;
 
-                    if (iq_cmd >  IQ_MAX_A) iq_cmd =  IQ_MAX_A;
-                    if (iq_cmd < -IQ_MAX_A) iq_cmd = -IQ_MAX_A;
-
-                    if (iq_cmd > -IQ_MAX_A && iq_cmd < IQ_MAX_A) {
-                        s_speed_integ += 0.03f * err * dt_s;  /* 3x积分速度，加快收敛 */
-                        if (s_speed_integ >  0.30f) s_speed_integ =  0.30f;
-                        if (s_speed_integ < -0.30f) s_speed_integ = -0.30f;
-                    }
-                    s_iq_ref_a = iq_cmd;
+                    /* ISR 级 PD 全权负责 IqRef，主循环不再写 */
+                    /* （主循环只负责更新 s_pos_target_deg） */
                 }
             }
-        }
         break;
     }
 
@@ -455,9 +499,6 @@ bool app_control_enable(void)
 
     /* 前提满足，使能 */
     s_fault = FAULT_NONE;
-    /* 速度估算器基准重置：防止旧角度/旧时间产生一帧错误速度 */
-    s_theta_prev_rad = encoder_get_angle_rad();
-    s_est_prev_ms    = HAL_GetTick();
     s_omega_est_rps  = 0.0f;
     /* 位置环滤波器初始化 */
     s_vel_filt_dps   = 0.0f;
@@ -468,16 +509,15 @@ bool app_control_enable(void)
 
 void app_control_disable(void)
 {
-    s_iq_ref_a = 0.0f;
+    set_iq_ref_internal(0.0f);
     /* 速度环清零 */
     s_speed_mode    = false;
     s_omega_ref_rps = 0.0f;
     s_omega_ref_cmd = 0.0f;
     s_speed_integ   = 0.0f;
     s_omega_est_rps = 0.0f;
-    /* 速度估算基准重置 */
-    s_theta_prev_rad = 0.0f;
-    s_est_prev_ms    = 0;
+    s_start_boost_until_ms = 0;
+    s_start_boost_sign     = 0.0f;
     /* 位置环清零（保留 home_offset，方便重新使能后直接用 P0）*/
     s_ctrl_mode    = CTRL_SPEED;
     s_vel_filt_dps = 0.0f;
@@ -504,7 +544,7 @@ uint8_t app_control_get_fault(void) { return s_fault; }
  */
 float app_control_get_iq_ref(void)
 {
-    if (s_state == STATE_RUN) {
+    if (s_state == STATE_RUN || s_state == STATE_ALIGN) {
         return s_iq_ref_a;
     }
     return 0.0f;
@@ -515,82 +555,171 @@ float app_control_get_iq_ref(void)
  * @note   写操作在主循环；ISR 读 s_iq_ref_a 为 volatile float，
  *         Cortex-M4 单精度浮点写为原子操作，无需额外临界区。
  */
+static void set_iq_ref_internal(float iq_ref_a)
+{
+    float prev = s_iq_ref_a;
+    bool need_reset = ((prev * iq_ref_a) < 0.0f || fabsf(iq_ref_a - prev) > 0.10f);
+    s_iq_ref_a = iq_ref_a;
+    if (need_reset) {
+        foc_interface_request_current_pi_reset();
+    }
+}
+
+static void set_iq_ref_slewed(float iq_ref_a, float dt_s)
+{
+    float max_step = IQ_SLEW_RATE_A_S * dt_s;
+    if (max_step < 0.001f) {
+        max_step = 0.001f;
+    }
+    float prev = s_iq_ref_a;
+    float delta = iq_ref_a - prev;
+    if (delta > max_step) {
+        iq_ref_a = prev + max_step;
+    } else if (delta < -max_step) {
+        iq_ref_a = prev - max_step;
+    }
+    set_iq_ref_internal(iq_ref_a);
+}
+
 void app_control_set_iq_ref(float iq_ref_a)
 {
-    s_iq_ref_a = iq_ref_a;
+    set_iq_ref_internal(iq_ref_a);
 }
 
 /* ============================================================
  * ALIGN 接口（串口 'a' 命令触发，不自动上电执行）
  * ============================================================ */
 #define ALIGN_HOLD_MS   (2000U)  /* 2s 对齐保持 */
-#define ALIGN_ID_V      (3.0f)   /* d 轴对齐电压 [V]，Rs=2.7Ω → I≈1.1A，确保转子锁定 */
+#define ALIGN_ID_V      (5.0f)   /* d 轴对齐电压 [V]，Rs=2.7Ω → I≈1.85A，强力锁定克服齿槽 */
 static uint32_t s_align_start_ms = 0;
+
+/* 旋转式 ALIGN 状态变量 */
+static uint8_t  s_align_phase = 0;
+static uint32_t s_align_phase_t0 = 0;
+static float    s_align_sin_sum = 0.0f;
+static float    s_align_cos_sum = 0.0f;
+static uint32_t s_align_sample_cnt = 0;
 
 bool app_control_start_align(void)
 {
     if (s_state != STATE_READY) return false;
-    /* 不再检 encoder_is_valid()，EMI 可能导致暂时失效 */
 
     s_align_start_ms = HAL_GetTick();
-    s_state = STATE_ALIGN;      /* 先设状态，ISR 才能立即走 ALIGN 分支 */
-    ctrl_sd_set(true);          /* 再使能驱动板（消除竞态窗口）*/
+    s_align_phase = 0;
+    s_align_sin_sum = 0.0f;
+    s_align_cos_sum = 0.0f;
+    s_align_sample_cnt = 0;
+    s_state = STATE_ALIGN;
+    ctrl_sd_set(true);
     return true;
 }
 
+/* === 旋转校准式 ALIGN（openloop + π/2 修正）===
+ * 用 openloop 模式旋转电机，采样 forced_theta 和 encoder 的相位差。
+ * 圆形平均 + π/2 修正得到 offset。方向已验证正确。
+ */
+#define ALIGN_OL_OMEGA      (5.5f)   /* rad/s 电气 */
+#define ALIGN_OL_VQ         (2.0f)   /* V */
+#define ALIGN_WARMUP_MS     (800U)
+#define ALIGN_SAMPLE_MS     (1500U)
+#define ALIGN_COOLDOWN_MS   (400U)
+#define ALIGN_TOTAL_MS      (ALIGN_WARMUP_MS + ALIGN_SAMPLE_MS + ALIGN_COOLDOWN_MS)
+
 static void align_update(const FocMeasurement_t *m)
 {
+    (void)m;
     uint32_t now = HAL_GetTick();
+    uint32_t elapsed = now - s_align_start_ms;
 
-    /* 超时保护
-     * ALIGN 仅持续 2s 且电流由固定电压限制（ALIGN_ID_V/Rs ≈ 1.1A），
-     * 安全性由硬超时保证。
-     * ⚠️ 不检 encoder_is_valid()：电机通电时 EMI 会让 PWM 捕获偶尔丢失，
-     *    导致 ALIGN 提前退出 offset=0。编码器只需在最终读取时有效即可。 */
-    bool overtime = ((now - s_align_start_ms) > (ALIGN_HOLD_MS + 500U));
-
-    if (overtime) {
+    if (elapsed > ALIGN_TOTAL_MS + 1000U) {
+        foc_openloop_stop();
         ctrl_sd_set(false);
         s_state = STATE_READY;
+        s_align_phase = 0;
         return;
     }
 
-    if ((now - s_align_start_ms) >= ALIGN_HOLD_MS) {
-        /* ── 记录编码器偏移 ── */
-        ctrl_sd_set(false);
-        HAL_Delay(3);
-
-        float samples[8];
-        for (int i = 0; i < 8; i++) {
-            samples[i] = encoder_get_angle_rad() * (float)MOTOR_POLE_PAIRS;
-            HAL_Delay(1);
+    if (s_align_phase == 0) {
+        foc_openloop_start(ALIGN_OL_OMEGA, ALIGN_OL_VQ);
+        s_align_phase = 1;
+        s_align_phase_t0 = now;
+        s_align_sin_sum = 0.0f;
+        s_align_cos_sum = 0.0f;
+        s_align_sample_cnt = 0;
+    }
+    else if (s_align_phase == 1) {
+        if (elapsed >= ALIGN_WARMUP_MS) {
+            s_align_phase = 2;
+            s_align_phase_t0 = now;
         }
-        for (int i = 0; i < 7; i++) {
-            for (int j = i+1; j < 8; j++) {
-                if (samples[i] > samples[j]) {
-                    float tmp = samples[i];
-                    samples[i] = samples[j];
-                    samples[j] = tmp;
-                }
+    }
+    else if (s_align_phase == 2) {
+        float forced_e = foc_openloop_get_theta();
+        float enc_e = encoder_get_elec_angle_rad((uint8_t)MOTOR_POLE_PAIRS);
+        float diff = forced_e - enc_e;
+        s_align_sin_sum += sinf(diff);
+        s_align_cos_sum += cosf(diff);
+        s_align_sample_cnt++;
+
+        if (elapsed >= ALIGN_WARMUP_MS + ALIGN_SAMPLE_MS) {
+            if (s_align_sample_cnt > 0) {
+                float avg_diff = atan2f(s_align_sin_sum, s_align_cos_sum);
+                s_theta_offset_e = -avg_diff + 1.5707963f;  /* +π/2 修正 */
+                while (s_theta_offset_e <  0.0f)               s_theta_offset_e += 6.28318530f;
+                while (s_theta_offset_e >= 6.28318530f)        s_theta_offset_e -= 6.28318530f;
             }
+            s_align_phase = 3;
+            s_align_phase_t0 = now;
         }
-        float raw_e = samples[3];
-        while (raw_e >= 2.0f * 3.14159265f) raw_e -= 2.0f * 3.14159265f;
-        while (raw_e <  0.0f)               raw_e += 2.0f * 3.14159265f;
-        s_theta_offset_e = raw_e;
-        while (s_theta_offset_e >= 2.0f * 3.14159265f) s_theta_offset_e -= 2.0f * 3.14159265f;
-        while (s_theta_offset_e <  0.0f)               s_theta_offset_e += 2.0f * 3.14159265f;
+    }
+    else if (s_align_phase == 3) {
+        uint32_t cd_elapsed = now - s_align_phase_t0;
+        if (cd_elapsed < ALIGN_COOLDOWN_MS) {
+            float ratio = 1.0f - (float)cd_elapsed / (float)ALIGN_COOLDOWN_MS;
+            foc_openloop_start(ALIGN_OL_OMEGA, ALIGN_OL_VQ * ratio);
+        } else {
+            foc_openloop_stop();
+            /* 进入方向验证阶段 */
+            s_align_phase = 4;
+            s_align_phase_t0 = now;
+            /* 记录验证前位置 */
+            s_align_sin_sum = encoder_get_angle_rad();  /* 复用变量存 pos_before */
+            /* 注入 +Iq 验证方向（ISR 级保护防飞车） */
+            set_iq_ref_internal(0.30f);
+        }
+    }
+    else if (s_align_phase == 4) {
+        /* 方向验证：+Iq 注入 300ms，看编码器方向 */
+        uint32_t vf_elapsed = now - s_align_phase_t0;
+        if (vf_elapsed >= 300U) {
+            set_iq_ref_internal(0.0f);
+            HAL_Delay(50);
+            float pos_after = encoder_get_angle_rad();
+            float pos_before = s_align_sin_sum;  /* 之前存的 */
+            float delta = pos_after - pos_before;
+            if (delta >  3.14159265f) delta -= 6.28318530f;
+            if (delta < -3.14159265f) delta += 6.28318530f;
 
-        /* 对齐完成，进入 READY。方向验证在 app_control_update() 的
-         * STATE_READY 中进行（需要 ISR 正常闭环才能注入 IqRef）。*/
-        s_state = STATE_READY;
-        s_align_need_verify = true;   /* 标记：下次 update 时做方向验证 */
+            /* +Iq 应该让电机往 MOTOR_SIGN 正方向走 */
+            if (delta * MOTOR_SIGN < -0.01f) {
+                /* 方向反了，offset 加 π */
+                s_theta_offset_e += 3.14159265f;
+                if (s_theta_offset_e >= 6.28318530f)
+                    s_theta_offset_e -= 6.28318530f;
+            }
+
+            ctrl_sd_set(false);
+            s_state = STATE_READY;
+            s_align_phase = 0;
+        }
     }
 }
 
 float app_control_get_align_id_ref(void)
 {
-    return (s_state == STATE_ALIGN) ? ALIGN_ID_V : 0.0f;
+    /* phase 4 时不注入 Vd（方向验证需要正常闭环） */
+    if (s_state == STATE_ALIGN && s_align_phase < 4) return ALIGN_ID_V;
+    return 0.0f;
 }
 
 float app_control_get_theta_offset(void)
@@ -615,25 +744,47 @@ float app_control_get_fine_offset(void)
 void app_control_set_speed_mode(bool enable)
 {
     if (enable && !s_speed_mode) {
-        /* 进入速度模式：清积分+基准重置+斜坡从当前速度开始 */
         s_speed_mode     = true;
         s_speed_integ    = 0.0f;
-        s_theta_prev_rad = encoder_get_angle_rad();
-        s_est_prev_ms    = HAL_GetTick();
-        s_omega_ref_rps  = s_omega_est_rps;
-        s_omega_ref_cmd  = s_omega_ref_rps;
-        /* 进入速度模式时退出位置模式 */
+        s_omega_ref_rps  = 0.0f;
+        s_omega_ref_cmd  = 0.0f;
+        s_start_boost_until_ms = 0;
+        s_start_boost_sign     = 0.0f;
+        /* 位置跟踪模式：初始化目标为当前位置 */
+        s_pos_target_deg = get_pos_actual_deg();
         if (s_ctrl_mode != CTRL_SPEED) {
             s_ctrl_mode    = CTRL_SPEED;
             s_vel_filt_dps = 0.0f;
         }
     } else if (!enable && s_speed_mode) {
         s_speed_mode = false;
+        s_start_boost_until_ms = 0;
+        s_start_boost_sign     = 0.0f;
     }
 }
 
 void app_control_set_omega_ref(float omega_rad_s)
 {
+    float prev = s_omega_ref_cmd;
+    bool start_or_reverse = (fabsf(omega_rad_s) >= 0.05f) &&
+                            (fabsf(prev) < 0.05f || (prev * omega_rad_s) < 0.0f);
+    if ((prev * omega_rad_s) < 0.0f ||
+        fabsf(omega_rad_s) < 0.05f ||
+        fabsf(omega_rad_s - prev) > 0.50f) {
+        s_speed_integ = 0.0f;
+    }
+    if (fabsf(omega_rad_s) < 0.05f) {
+        s_omega_ref_rps = 0.0f;
+        s_start_boost_until_ms = 0;
+        s_start_boost_sign     = 0.0f;
+        set_iq_ref_internal(0.0f);
+    } else if ((prev * omega_rad_s) < 0.0f) {
+        s_omega_ref_rps = 0.0f;
+    }
+    if (start_or_reverse) {
+        s_start_boost_until_ms = HAL_GetTick() + START_BOOST_MS;
+        s_start_boost_sign = (omega_rad_s > 0.0f) ? 1.0f : -1.0f;
+    }
     s_omega_ref_cmd = omega_rad_s;
 }
 
@@ -690,6 +841,13 @@ void app_control_home(void)
 
 float app_control_get_pos_actual_deg(void) { return get_pos_actual_deg(); }
 float app_control_get_pos_target_deg(void) { return s_pos_target_deg; }
+
+float app_control_get_pos_target(void) { return s_pos_target_deg; }
+float app_control_get_pos_home_offset(void) { return s_pos_home_offset_deg; }
+bool app_control_is_pos_tracking(void) {
+    return (s_ctrl_mode == CTRL_STABILIZE) ||
+           (s_ctrl_mode == CTRL_SPEED && s_speed_mode);
+}
 
 void app_control_set_kp_pos(float kp)
 {

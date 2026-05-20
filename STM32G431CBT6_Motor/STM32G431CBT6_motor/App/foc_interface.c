@@ -16,7 +16,7 @@
 #include "foc_interface.h"
 #include "foc_controller.h"
 #include "board_config.h"
-#include "encoder_if.h"
+#include "encoder_spi.h"
 #include "app_control.h"
 #include "stm32g4xx_hal.h"
 #include <string.h>
@@ -40,6 +40,7 @@
 
 // #define FOC_DBG_DUTY_TEST
 // #define FOC_DBG_FIXED_VECTOR   /* 第二轮验证：重构后电流符号是否正确 */
+// #define FOC_DBG_SINGLE_CH      /* 第三轮：单通道 PA8/PA9/PA10 各自独立驱动诊断 */
 
 /* 固定矢量参数（首次先用 0.3V，无响应再小步加到 0.5V，别超 1A） */
 #define DBG_VEC_V       (0.3f)    /* 施加相电压 [V] */
@@ -82,7 +83,9 @@ static volatile float s_openloop_theta  = 0.0f;
 static volatile float s_openloop_omega  = 0.0f;
 static volatile float s_openloop_vq     = 0.0f;
 static volatile bool  s_pi_bypass       = false;
+static volatile bool  s_current_pi_reset_req = false;
 #define OPENLOOP_DT  (1.0f / 20000.0f)
+#define IQ_ZERO_DEADBAND_A (0.005f)
 
 /* ---- 开环期间编码器诊断 ---- */
 static volatile float s_calib_sum_plus  = 0.0f;  /* sum(theta_ol + raw_e) */
@@ -99,15 +102,9 @@ static volatile float s_forced_omega  = 0.0f;   /* 电角速度 [rad/s] */
 void foc_interface_set_pi_bypass(bool on) { s_pi_bypass = on; }
 static volatile float s_bypass_vq = 0.0f;
 void foc_interface_set_bypass_vq(float vq) { s_bypass_vq = vq; }
+void foc_interface_request_current_pi_reset(void) { s_current_pi_reset_req = true; }
 
-/* ---- 编码器角度预测器 ---- */
-static volatile float s_pred_raw_e_prev = 0.0f;   /* 上次编码器电角度 */
-static volatile float s_pred_omega_e   = 0.0f;    /* 估算电角速度 [rad/s] */
-static volatile uint32_t s_pred_age    = 0;        /* 自上次编码器更新后的ISR计数 */
-static volatile uint32_t s_pred_last_ms = 0;       /* 上次编码器捕获时间戳 [ms] */
-#define PRED_ALPHA  (0.3f)                          /* 速度IIR滤波系数 */
-#define PRED_MAX_AGE (200U)                         /* 最大外推200周期=10ms */
-
+/* ---- 5ms 滑窗速度估算（ISR 内，替代旧预测器）---- */
 void foc_forced_start(float elec_omega_rps) {
     s_forced_theta = 0.0f;
     s_forced_omega = elec_omega_rps;
@@ -115,6 +112,14 @@ void foc_forced_start(float elec_omega_rps) {
 }
 void foc_forced_stop(void) {
     s_forced_active = false;
+}
+
+float foc_forced_get_theta(void) {
+    return s_forced_theta;
+}
+
+float foc_openloop_get_theta(void) {
+    return s_openloop_theta;
 }
 
 /* ---------------------------------------------------------- */
@@ -289,25 +294,57 @@ void foc_interface_step(const uint16_t *adc_raw)
         foc_controller_step();
     }
 
+#elif defined(FOC_DBG_SINGLE_CH)
+    /* ==== 单通道 CH1/CH2/CH3 激活诊断 ====
+     * 每 500ms 切换：CH1+/CH2+/CH3+/全50%（静默对照）
+     * 一次只激活一个 PWM 通道高出 50%，其他两相保持 50%。
+     * 预期 Y 接电机：只有激活通道对应物理相驱动电流为正，其余两相返回 -1/2 各。
+     * 用于诊断：PA8/PA9/PA10 各自实际控制驱动板的哪相 H 桥。
+     * 看遥测 VEC=0/1/2/3 + IU/IV/IW 联合判断。 */
+    {
+        static uint8_t  s_sp  = 0;
+        static uint32_t s_st0 = 0;
+        uint32_t now_ms = HAL_GetTick();
+        if ((now_ms - s_st0) >= 500U) {
+            s_sp  = (uint8_t)((s_sp + 1U) % 4U);
+            s_st0 = now_ms;
+        }
+        s_dbg_vec_phase = s_sp;  /* 0/1/2 = CH1+/CH2+/CH3+; 3 = idle */
+        float d = (vbus > 1.0f) ? (0.5f * 1.0f / vbus) : 0.0f;  /* Vq=1V 单相，电流 ~0.4A */
+        switch (s_sp) {
+        case 0:  foc_interface_write_ccr(0.5f+d, 0.5f, 0.5f); break;  /* CH1+ */
+        case 1:  foc_interface_write_ccr(0.5f, 0.5f+d, 0.5f); break;  /* CH2+ */
+        case 2:  foc_interface_write_ccr(0.5f, 0.5f, 0.5f+d); break;  /* CH3+ */
+        default: foc_interface_write_ccr(0.5f, 0.5f, 0.5f); break;     /* idle */
+        }
+        foc_controller_U.In_reset = true;
+        foc_controller_U.In_I_a = iu; foc_controller_U.In_I_b = iv;
+        foc_controller_U.In_theta_e = 0.0f; foc_controller_U.In_iq_ref = 0.0f;
+        foc_controller_U.In_V_bus = vbus;
+        foc_controller_step();
+    }
+
 #else
     /* --- Step 2: 编码器电角度 --- */
     uint8_t ctrl_state = app_control_get_state();
     float elec_angle;
     s_dbg_vec_phase = 0xFF;  /* 非调试模式标记 */
 
-    if (ctrl_state == STATE_ALIGN) {
-        /* 对齐模式：强制 theta_e = 0 ，居中转子到电气零点
-         * 直接输出固定 SVPWM（不经 PI），Vd=0.3V，Vq=0。
-         * SVPWM @theta=0: duty_a=0.5+0.75*Vd/Vbus, duty_b=duty_c=0.5-0.75*Vd/Vbus */
-        float vd  = app_control_get_align_id_ref();   /* 在这里含义是 Vd [V] */
-        float d   = (vbus > 1.0f) ? (0.75f * vd / vbus) : 0.0f;
-        foc_interface_write_ccr(0.5f + d, 0.5f - d, 0.5f - d);
-        /* 重置积分器 */
-        foc_controller_U.In_reset = true;
-        foc_controller_U.In_I_a = iu; foc_controller_U.In_I_b = iv;
-        foc_controller_U.In_theta_e = 0.0f; foc_controller_U.In_iq_ref = 0.0f;
-        foc_controller_U.In_V_bus = vbus;
-        foc_controller_step();
+    if (ctrl_state == STATE_ALIGN && !s_forced_active && !s_openloop_active) {
+        float vd  = app_control_get_align_id_ref();
+        if (vd > 0.1f) {
+            /* Vd 锁定模式（phase 0-3） */
+            float d   = (vbus > 1.0f) ? (0.75f * vd / vbus) : 0.0f;
+            foc_interface_write_ccr(0.5f + d, 0.5f - d, 0.5f - d);
+            foc_controller_U.In_reset = true;
+            foc_controller_U.In_I_a = iu; foc_controller_U.In_I_b = iv;
+            foc_controller_U.In_theta_e = 0.0f; foc_controller_U.In_iq_ref = 0.0f;
+            foc_controller_U.In_V_bus = vbus;
+            foc_controller_step();
+        } else {
+            /* phase 4 方向验证：走正常闭环（用 offset + Iq） */
+            goto normal_closed_loop;
+        }
     } else if (s_openloop_active) {
         /* ---- 开环强制换向：手动扫描电角度 ---- */
         s_openloop_theta += s_openloop_omega * OPENLOOP_DT;
@@ -362,7 +399,10 @@ void foc_interface_step(const uint16_t *adc_raw)
         foc_controller_U.In_theta_e = elec_angle;
         foc_controller_U.In_iq_ref  = app_control_get_iq_ref();
         foc_controller_U.In_V_bus   = vbus;
-        foc_controller_U.In_reset   = false;
+        /* 响应 PI 复位请求（forced 启动时调一次防 PI 残留） */
+        bool reset_now = s_current_pi_reset_req;
+        s_current_pi_reset_req = false;
+        foc_controller_U.In_reset   = reset_now;
         foc_controller_step();
         foc_interface_write_ccr(
             foc_controller_Y.Out_duty_a,
@@ -370,69 +410,120 @@ void foc_interface_step(const uint16_t *adc_raw)
             foc_controller_Y.Out_duty_c
         );
     } else {
-        /* ---- 正常闭环模式（带角度预测）---- */
+        /* ---- 正常闭环模式（SPI 编码器 + 5ms 滑窗速度）---- */
+        normal_closed_loop: ;
+
+        /* 角度直接读缓存（主循环中 SPI 更新） */
         float raw_e  = encoder_get_elec_angle_rad(MOTOR_POLE_PAIRS);
         float offset = app_control_get_theta_offset();
         float fine   = app_control_get_fine_offset();
 
-        /* 用硬件捕获时间戳检测编码器是否真正更新 */
-        uint32_t enc_ms = encoder_get_last_capture_ms();
-        if (enc_ms != s_pred_last_ms && s_pred_last_ms != 0) {
-            /* 编码器有新数据——计算电角速度 */
-            uint32_t dt_ms = enc_ms - s_pred_last_ms;
-            if (dt_ms > 0 && dt_ms < 50) {  /* 合理范围 1-50ms */
-                float dt = (float)dt_ms * 0.001f;
-                float delta_e = raw_e - s_pred_raw_e_prev;
-                if (delta_e >  3.14159f) delta_e -= TWO_PI;
-                if (delta_e < -3.14159f) delta_e += TWO_PI;
-                float omega_new = delta_e / dt;
-                s_pred_omega_e = PRED_ALPHA * omega_new
-                               + (1.0f - PRED_ALPHA) * s_pred_omega_e;
-            }
-            s_pred_raw_e_prev = raw_e;
-            s_pred_last_ms = enc_ms;
-            s_pred_age = 0;
-        } else {
-            if (s_pred_last_ms == 0) {
-                s_pred_last_ms = enc_ms;
-                s_pred_raw_e_prev = raw_e;
-            }
-            s_pred_age++;
-            if (s_pred_age > PRED_MAX_AGE) {
-                s_pred_omega_e = 0.0f;
-            }
-        }
-
-        /* 线性预测：补偿编码器延迟
-         *
-         * 电角度方向约定：
-         *   对齐时 Vd=3V@θe=0 将转子 d 轴锁定到定子 α 轴。
-         *   编码器正向 = 电机磁场正向 → elec = raw_e - offset。
-         *   之前 offset - raw_e 的符号反了，导致 FOC 对电机旋转
-         *   施加反向制动转矩，电机被自己锁死。 */
-        float predicted_raw_e = raw_e + s_pred_omega_e * (float)s_pred_age * OPENLOOP_DT;
-        elec_angle = predicted_raw_e - offset + fine;
+        /* 电角度（无预测，SPI 与电流采样严格同步） */
+        elec_angle = raw_e - offset + fine;
         while (elec_angle <  0.0f)               elec_angle += TWO_PI;
         while (elec_angle >= TWO_PI)              elec_angle -= TWO_PI;
-
         s_meas_buf.angle_rad = elec_angle;
 
-        /* 低通滤波电流测量值，抑制高频噪声导致的 PI 振荡。
-         * α=0.2 → 时间常数 ~5 采样点(250μs)，远小于电流环响应时间。 */
+        /* 5ms 滑窗速度估算（100×50μs） */
+        /* 低通滤波电流测量值 */
         static float s_iu_filt = 0.0f, s_iv_filt = 0.0f;
         static bool  s_filt_init = false;
         if (!s_filt_init) { s_iu_filt = iu; s_iv_filt = iv; s_filt_init = true; }
         s_iu_filt = 0.2f * iu + 0.8f * s_iu_filt;
         s_iv_filt = 0.2f * iv + 0.8f * s_iv_filt;
 
+        float iq_ref_cmd = app_control_get_iq_ref();
+
+        /* ---- ISR 级位置 PD 控制器（1kHz，每次编码器更新时执行）----
+         * 直接用编码器角度做 PD，不依赖主循环的慢速度估计。
+         * 只在 STABILIZE 或 SPEED+speed_mode 时激活。 */
+        {
+            static float s_prev_mech_rad = 0.0f;
+            static float s_vel_isr_dps = 0.0f;
+            static bool  s_mech_init = false;
+            float cur_mech = encoder_get_angle_rad();
+            if (!s_mech_init) {
+                s_prev_mech_rad = cur_mech;
+                s_mech_init = true;
+            }
+            float dm = cur_mech - s_prev_mech_rad;
+            if (dm >  3.14159265f) dm -= 6.28318530f;
+            if (dm < -3.14159265f) dm += 6.28318530f;
+            s_prev_mech_rad = cur_mech;
+
+            /* dm 只在编码器更新时非零（每 1ms）。
+             * 速度 = dm / 0.001s，IIR 滤波 */
+            if (fabsf(dm) > 0.0001f) {
+                float spd_raw_dps = dm * (180.0f / 3.14159265f) / 0.001f;
+                /* 限幅防 EMI 毛刺 */
+                if (spd_raw_dps >  1000.0f) spd_raw_dps =  1000.0f;
+                if (spd_raw_dps < -1000.0f) spd_raw_dps = -1000.0f;
+                s_vel_isr_dps = 0.5f * spd_raw_dps + 0.5f * s_vel_isr_dps;
+            }
+
+            /* 速度保护：> 400°/s 切断 */
+            if (fabsf(s_vel_isr_dps) > 400.0f) {
+                iq_ref_cmd = 0.0f;
+            }
+            /* ISR 级 PD：在 STABILIZE、POSITION 或 SPEED+speed_mode 时激活 */
+            else if (ctrl_state == STATE_RUN &&
+                     (app_control_get_ctrl_mode() == CTRL_STABILIZE ||
+                      app_control_get_ctrl_mode() == CTRL_POSITION ||
+                      app_control_is_pos_tracking())) {
+                /* 直接用主循环算好的 pos_actual 和 target，避免 wrap 不一致 */
+                float pos_actual = app_control_get_pos_actual_deg();
+                float target = app_control_get_pos_target();
+                float pos_err = target - pos_actual;
+                /* wrap 误差到 ±180° */
+                if (pos_err >  180.0f) pos_err -= 360.0f;
+                if (pos_err < -180.0f) pos_err += 360.0f;
+                if (pos_err >  25.0f) pos_err =  25.0f;
+                if (pos_err < -25.0f) pos_err = -25.0f;
+
+                #define ISR_KP_NEAR (0.015f)  /* A/deg — 误差<10°时，防抖 */
+                #define ISR_KP_FAR  (0.030f)  /* A/deg — 误差>10°时，快速回位 */
+                #define ISR_KD  (0.010f)   /* A/(deg/s) */
+                #define ISR_KI  (0.0005f)  /* A/(deg·s) */
+                #define ISR_KI_MAX (0.25f)
+                #define ISR_IQ_MAX (0.45f)
+
+                static float s_isr_integ = 0.0f;
+                static float s_prev_pos_err = 0.0f;
+
+                /* 非线性 KP：远处大力回位，近处轻柔防抖 */
+                float kp_now = (fabsf(pos_err) > 10.0f) ? ISR_KP_FAR : ISR_KP_NEAR;
+
+                /* 积分 */
+                if (fabsf(pos_err) < 20.0f) {
+                    s_isr_integ += ISR_KI * pos_err;
+                    if (s_isr_integ >  ISR_KI_MAX) s_isr_integ =  ISR_KI_MAX;
+                    if (s_isr_integ < -ISR_KI_MAX) s_isr_integ = -ISR_KI_MAX;
+                }
+                if (s_prev_pos_err * pos_err < 0.0f && fabsf(pos_err) < 3.0f) {
+                    s_isr_integ *= 0.5f;
+                }
+                s_prev_pos_err = pos_err;
+
+                iq_ref_cmd = kp_now * pos_err + s_isr_integ - ISR_KD * s_vel_isr_dps;
+                if (iq_ref_cmd >  ISR_IQ_MAX) iq_ref_cmd =  ISR_IQ_MAX;
+                if (iq_ref_cmd < -ISR_IQ_MAX) iq_ref_cmd = -ISR_IQ_MAX;
+            }
+        }
+
+        bool zero_torque = (fabsf(iq_ref_cmd) < IQ_ZERO_DEADBAND_A);
+
         foc_controller_U.In_I_a     = s_iu_filt;
         foc_controller_U.In_I_b     = s_iv_filt;
         foc_controller_U.In_theta_e = elec_angle;
-        foc_controller_U.In_iq_ref  = app_control_get_iq_ref();
+        foc_controller_U.In_iq_ref  = zero_torque ? 0.0f : iq_ref_cmd;
         foc_controller_U.In_V_bus   = vbus;
-        foc_controller_U.In_reset   = (ctrl_state != STATE_RUN);
+        bool reset_pi = (ctrl_state != STATE_RUN) || s_current_pi_reset_req || zero_torque;
+        s_current_pi_reset_req = false;
+        foc_controller_U.In_reset   = reset_pi;
         foc_controller_step();
-        if (!s_pi_bypass) {
+        if (zero_torque) {
+            foc_interface_write_ccr(0.5f, 0.5f, 0.5f);
+        } else if (!s_pi_bypass) {
             foc_interface_write_ccr(
                 foc_controller_Y.Out_duty_a,
                 foc_controller_Y.Out_duty_b,

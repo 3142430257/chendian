@@ -24,6 +24,7 @@ typedef struct {
     float angle_rad;/* 电角度 [rad]，由 encoder_get_elec_angle_rad() 更新 */
     float id_meas;  /* d轴实测电流 [A]（Clarke+Park变换后）*/
     float iq_meas;  /* q轴实测电流 [A]（Clarke+Park变换后）*/
+    float omega_est;/* 机械角速度估算 [rad/s]，ISR 内 5ms 滑窗+IIR */
 } FocMeasurement_t;
 
 /**
@@ -124,10 +125,16 @@ uint32_t foc_interface_get_isr_freq(void);
 /** @brief  PI 旁路模式：on=true 时 RUN 状态输出 50/50/50 占空比（零电压）*/
 void foc_interface_set_pi_bypass(bool on);
 void foc_interface_set_bypass_vq(float vq);
+void foc_interface_request_current_pi_reset(void);
 
 /** @brief  强制闭环旋转：角度固定递增 + PI电流环（不用编码器）*/
 void foc_forced_start(float elec_omega_rps);
 void foc_forced_stop(void);
+
+/** @brief  读取当前 forced 模式的内部电角度，用于 ALIGN 旋转校准 */
+float foc_forced_get_theta(void);
+/** @brief  读取当前 openloop 模式的内部电角度 */
+float foc_openloop_get_theta(void);
 
 /** @brief  开环校准数据读取 */
 void foc_calib_get(float *avg_plus, float *avg_minus, uint32_t *cnt, float *enc_last);

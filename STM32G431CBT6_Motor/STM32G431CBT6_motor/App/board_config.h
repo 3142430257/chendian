@@ -74,10 +74,11 @@ extern uint16_t iw_offset_raw;
 
 /* ============================================================
  * 母线电压
- * 分压电路：POWER → R112(12K) → R113(12K) → ADC_pin → R115(1K) → GND
- * 分压比 = (12+12+1) / 1 = 25
+ * 分压电路：POWER → R112 → R113 → ADC_pin → R115 → GND
+ * 标注：12K + 12K + 1K，分压比 25:1
+ * 实测：12V → ADC 0.380V → 实际分压比 31.6:1（电阻误差）
  * ============================================================ */
-#define VBUS_DIVIDER        (25.0f)
+#define VBUS_DIVIDER        (31.6f)
 #define ADC_TO_VBUS(raw)    (ADC_TO_VOLT(raw) * VBUS_DIVIDER)
 
 /* VBUS 软件保护阈值 */

@@ -22,7 +22,7 @@ Ts_ctrl   = single(Ts);     % 控制器内部用 [s] (single, 给 PI 积分计�
 theta_offset = single(0.0); % 机械角零点偏差 [rad]
 
 % -- 4. 电流环 PI 参数（极点配置法, 带宽 100Hz，验证稳定性）--
-f_bw  = 30;                            % 电流环带宽 [Hz]（极保守，优先稳定性）
+f_bw  = 200;                            % 电流环带宽 [Hz]（拉高破静摩擦）
 wc    = 2*pi*f_bw;
 Kp_d  = single(Ld * wc);               % d轴 Kp = Ld * wc ≈ 0.126
 Ki_d  = single(Rs * wc);               % d轴 Ki = Rs * wc ≈ 1696

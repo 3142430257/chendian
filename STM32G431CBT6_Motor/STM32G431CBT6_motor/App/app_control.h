@@ -125,7 +125,7 @@ typedef enum {
 /** 位置软/硬限位角度（单位：度） */
 #define POS_SOFT_LIM_DEG   (90.0f)   /**< 目标 clamp 上限 */
 #define POS_WARN_LIM_DEG  (100.0f)   /**< 实际角预警 + 限速 30% */
-#define POS_HARD_LIM_DEG  (110.0f)   /**< 实际角硬限位：只允许往内回 */
+#define POS_HARD_LIM_DEG  (360.0f)   /**< 临时关闭硬限位，专心调速度环 */
 
 /** @brief 切换控制模式（自动清积分和速度滤波器）*/
 void app_control_set_ctrl_mode(CtrlMode_t mode);
@@ -150,6 +150,13 @@ float app_control_get_pos_actual_deg(void);
 
 /** @brief 获取当前位置目标角 [deg] */
 float app_control_get_pos_target_deg(void);
+
+/** @brief ISR 用：获取位置目标 [deg] */
+float app_control_get_pos_target(void);
+/** @brief ISR 用：获取 home 偏移 [deg] */
+float app_control_get_pos_home_offset(void);
+/** @brief ISR 用：是否处于位置跟踪模式 */
+bool app_control_is_pos_tracking(void);
 
 /* ---- 运行时调参接口 ---- */
 void app_control_set_kp_pos(float kp);           /**< 位置 P 增益 */

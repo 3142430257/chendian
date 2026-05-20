@@ -31,13 +31,14 @@
 #include <stdlib.h>
 #include <math.h>
 #include "app_control.h"
-#include "encoder_pwm.h"
+#include "encoder_spi.h"
 #include "foc_interface.h"
 #include "telemetry.h"
 #include "mpu6050.h"       /* IMU 驱动（I2C1，CubeMX 使能后生效）*/
 #include "openloop_stab.h" /* 开环自稳（临时方案，编码器修好后删除）*/
 #include "board_config.h"  /* MOTOR_POLE_PAIRS */
 #include "encoder_if.h"    /* encoder_get_angle_rad */
+#include "spi.h"
 /* 注意：CubeMX 生成 i2c.h 后下一行自动插入 */
 /* USER CODE END Includes */
 
@@ -539,10 +540,12 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART3_UART_Init();
+  __HAL_RCC_SPI1_CLK_ENABLE();  /* 确保 SPI1 时钟在 Init 前已开 */
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   // 1. 初始化各应用模块
   foc_interface_init();
-  encoder_pwm_init();
+  encoder_spi_init();
   app_control_init();
   telemetry_init();
   /* IMU 初始化（CubeMX 生成 MX_I2C1_Init 并在此之前调用后，此处有效）
@@ -654,6 +657,12 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         /* 验证2: Pulse 首 */
         HAL_GPIO_WritePin(TEST_PIN_GPIO_Port, TEST_PIN_Pin, GPIO_PIN_SET);
 
+        static uint16_t enc_div = 0;
+        if (++enc_div >= 20U) {
+            enc_div = 0;
+            encoder_spi_read_isr();
+        }
+
         foc_interface_step(adc_raw_buffer);
 
         /* 验证2: Pulse 尾 */
@@ -661,11 +670,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     }
 }
 
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-    if (htim == &htim2) {
-        encoder_pwm_capture_callback(htim);
-    }
-}
 /* USER CODE END 4 */
 
 /**
