@@ -48,6 +48,7 @@ System.Management.Automation.Internal.Host.InternalHost/
 *.mp4
 *.rar
 tmp/
+tools/
 STM32G431CBT6_Motor/
 重点代码压缩包/
 

@@ -31,7 +31,7 @@ def _i(m: re.Match, i: int) -> int:
     return int(m.group(i))
 
 
-# Core telemetry — middle section uses lazy .*? like foc_ctl.py
+# Core telemetry: the middle section is intentionally parsed lazily.
 TELEMETRY_RE = re.compile(
     r"T,(\d+),IU,([-\d.]+),IV,([-\d.]+),IW,([-\d.]+),"
     r"VBUS,([-\d.]+),M_ANG,([-\d.]+),E_ANG,([-\d.]+),ST,(\d+),FAULT,(\d+),"

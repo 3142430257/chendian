@@ -45,10 +45,6 @@ IMU (MPU6050) ──→ 位置目标 ──→ ISR 级 PID ──→ IqRef ─�
 │   └── cubemx_reference/          # 早期 CubeMX 参考工程，非当前主入口
 ├── host/
 │   └── qt_host/                   # PySide6 图形上位机
-├── tools/
-│   ├── foc_ctl.py                 # 串口命令序列 + watchdog 工具
-│   ├── foc_monitor.py             # 串口遥测诊断工具
-│   └── quick.py                   # 遥测 JSON 快速检查脚本
 ├── models/
 │   ├── foc_controller.slx         # Simulink 电流环模型
 │   ├── foc_sim.slx                # 闭环仿真模型
@@ -82,8 +78,8 @@ cmake --build --preset Debug
 ### 串口控制
 
 ```bash
-python tools/foc_ctl.py run "d:1;a:4.5;e:0.3;H:0.5;G:30;d:0.5"
-python tools/foc_monitor.py COM11 115200
+# 使用串口终端或图形上位机发送命令：
+# a, e, H, G, S40, S-40, S0, d
 ```
 
 ### 图形上位机
