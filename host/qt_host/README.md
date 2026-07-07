@@ -8,7 +8,7 @@
 - 实时曲线：位置 / Iq / IMU Pitch（约 60 s 滚动窗口）
 - 一键流程：**校准 (a)** → **使能 (e)** → **Home (H)** → **自稳 (G)**
 - 速度滑块 `S<dps>`、直接力矩 `I<amps>`、急停 **d**（连发 3 次）
-- 软件看门狗（与 `tmp/foc_ctl.py` 阈值一致，可关）
+- 软件看门狗（与 `tools/foc_ctl.py` 阈值一致，可关）
 
 ## 环境
 
@@ -16,7 +16,7 @@
 - Windows / Linux（需 Qt 平台插件）
 
 ```powershell
-cd qt_host
+cd host\qt_host
 pip install -r requirements.txt
 python main.py
 ```
@@ -28,7 +28,7 @@ USB 转 TTL 接 MCU **USART3**（与 `foc_ctl.py` 相同）。上电后先等 `S
 ## 目录
 
 ```
-qt_host/
+host/qt_host/
   main.py                 # 启动
   foc_host/
     main_window.py        # UI

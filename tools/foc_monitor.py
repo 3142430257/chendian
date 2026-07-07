@@ -5,7 +5,7 @@ FOC 实时串口诊断工具
 - 包含自动急停保护（电流>1.5A 或 vbus<10V 自动发 d），单次保护避免循环
 - 实时判断 FOC 状态及解析 FAULT 标志位
 - 支持发送命令 (a/e/d/+/-/s)
-- 用法: python foc_monitor.py [PORT] [BAUD]
+- 用法: python tools/foc_monitor.py [PORT] [BAUD]
 """
 import serial
 import re

@@ -38,23 +38,30 @@ IMU (MPU6050) ──→ 位置目标 ──→ ISR 级 PID ──→ IqRef ─�
 ## 目录结构
 
 ```
-├── STM32G431CBT6_Motor/     # 固件工程（CMake 构建）
-│   └── App/                 # 应用层代码
-│       ├── app_control.c    # 状态机 + 位置跟踪 + 自稳逻辑
-│       ├── foc_interface.c  # ISR：电流环 + ISR级PID + 安全保护
-│       ├── foc_controller.c # Simulink 生成的电流环 PI
-│       ├── encoder_spi.c    # AS5048A SPI 驱动 + 速度估计
-│       ├── mpu6050.c        # IMU 驱动
-│       └── telemetry.c      # 串口遥测 (100Hz)
-├── cubemx_out/              # STM32CubeMX 工程
-├── foc_controller_ert_rtw/  # Simulink Coder 生成代码
-├── foc_controller.slx       # Simulink 电流环模型
-├── foc_sim.slx              # 闭环仿真模型
-├── foc_params.m             # 电机/PI 参数
-├── tmp/foc_ctl.py           # 串口控制 + watchdog 工具
-├── qt_host/                 # PySide6 图形上位机（见 qt_host/README.md）
-├── gimbal_mount/            # 3D 打印支架 STL
-└── 原理图&封装/              # 硬件设计文档
+├── firmware/
+│   ├── STM32G431CBT6_motor/       # 当前主固件工程（CMake 构建）
+│   │   ├── App/                   # FOC、状态机、编码器、IMU、遥测
+│   │   └── Core/                  # CubeMX 生成的 HAL 外设代码
+│   └── cubemx_reference/          # 早期 CubeMX 参考工程，非当前主入口
+├── host/
+│   └── qt_host/                   # PySide6 图形上位机
+├── tools/
+│   ├── foc_ctl.py                 # 串口命令序列 + watchdog 工具
+│   ├── foc_monitor.py             # 串口遥测诊断工具
+│   └── quick.py                   # 遥测 JSON 快速检查脚本
+├── models/
+│   ├── foc_controller.slx         # Simulink 电流环模型
+│   ├── foc_sim.slx                # 闭环仿真模型
+│   ├── foc_params.m               # 电机/PI 参数
+│   └── foc_controller_ert_rtw/    # Simulink Coder 生成代码与报告
+├── hardware/
+│   ├── gimbal_mount/              # 3D 打印支架 STL 与渲染图
+│   ├── schematics_and_package/    # 原理图、封装、器件资料
+│   └── controller_board/          # 主控/驱动板参考资料
+└── docs/
+    ├── report/                    # 竞赛报告与技术文档
+    ├── media/                     # README/报告用图片
+    └── references/                # 外部 PDF 参考资料
 ```
 
 ## 快速开始
@@ -62,18 +69,29 @@ IMU (MPU6050) ──→ 位置目标 ──→ ISR 级 PID ──→ IqRef ─�
 ### 编译烧录
 
 ```powershell
-cmake --build STM32G431CBT6_Motor\STM32G431CBT6_motor\build\Debug
+cd firmware\STM32G431CBT6_motor
+cmake --preset Debug
+cmake --build --preset Debug
 
 & 'D:\STM32CubeCLT_1.21.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe' `
   -c port=SWD mode=UR reset=HWrst `
-  -w 'STM32G431CBT6_Motor\STM32G431CBT6_motor\build\Debug\STM32G431CBT6_motor.elf' `
+  -w 'build\Debug\STM32G431CBT6_motor.elf' `
   -v -rst
 ```
 
 ### 串口控制
 
 ```bash
-python tmp/foc_ctl.py run "d:1;a:4.5;e:0.3;H:0.5;G:30;d:0.5"
+python tools/foc_ctl.py run "d:1;a:4.5;e:0.3;H:0.5;G:30;d:0.5"
+python tools/foc_monitor.py COM11 115200
+```
+
+### 图形上位机
+
+```powershell
+cd host\qt_host
+pip install -r requirements.txt
+python main.py
 ```
 
 ### 命令列表

@@ -1,9 +1,9 @@
 """FOC 串口测试工具：抓帧 + 解析 + 命令脚本 + watchdog 自动急停
 
 用法：
-    python foc_ctl.py snapshot 5
-    python foc_ctl.py run "d:0.5;a:2.8;e:0.5;S10:4;S0:3;d:0.5"
-    python foc_ctl.py stop          # 强制发 d 急停
+    python tools/foc_ctl.py snapshot 5
+    python tools/foc_ctl.py run "d:0.5;a:2.8;e:0.5;S10:4;S0:3;d:0.5"
+    python tools/foc_ctl.py stop          # 强制发 d 急停
 """
 import serial
 import re
