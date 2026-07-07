@@ -38,6 +38,10 @@ stl_report.txt
 out.txt
 check.txt
 verify_out.txt
+tmp/pdf_views/
+
+# Accidental PowerShell host copy target
+System.Management.Automation.Internal.Host.InternalHost/
 
 # MATLAB data files (large)
 *.mat

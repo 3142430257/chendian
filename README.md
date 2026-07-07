@@ -52,6 +52,7 @@ IMU (MPU6050) ──→ 位置目标 ──→ ISR 级 PID ──→ IqRef ─�
 ├── foc_sim.slx              # 闭环仿真模型
 ├── foc_params.m             # 电机/PI 参数
 ├── tmp/foc_ctl.py           # 串口控制 + watchdog 工具
+├── qt_host/                 # PySide6 图形上位机（见 qt_host/README.md）
 ├── gimbal_mount/            # 3D 打印支架 STL
 └── 原理图&封装/              # 硬件设计文档
 ```
