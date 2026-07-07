@@ -43,5 +43,10 @@ tmp/pdf_views/
 # Accidental PowerShell host copy target
 System.Management.Automation.Internal.Host.InternalHost/
 
+# Local delivery bundles / large media
+*.mp4
+*.rar
+重点代码压缩包/
+
 # MATLAB data files (large)
 *.mat
